@@ -214,9 +214,9 @@ atomic_example_impls! { AtomicI64 }
 atomic_example_impls! { AtomicIsize }
 atomic_example_impls! { AtomicBool }
 
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(not(any(target_arch = "bpf", target_env = "sgx")))]
 use generic_array::{ArrayLength, GenericArray};
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(not(any(target_arch = "bpf", target_env = "sgx")))]
 impl<T: Default, U: ArrayLength<T>> AbiExample for GenericArray<T, U> {
     fn example() -> Self {
         Self::default()
@@ -414,7 +414,7 @@ impl<T: std::cmp::Ord + AbiExample> AbiExample for BTreeSet<T> {
     }
 }
 
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(not(any(target_arch = "bpf", target_env = "sgx")))]
 impl AbiExample for memmap2::MmapMut {
     fn example() -> Self {
         memmap2::MmapMut::map_anon(1).expect("failed to map the data file")

@@ -1,5 +1,5 @@
 use {
-    crate::accounts_index::RollingBitField,
+    crate::rolling_bit_field::RollingBitField,
     core::fmt::{Debug, Formatter},
     solana_sdk::clock::Slot,
     std::collections::HashMap,
@@ -85,8 +85,12 @@ impl Ancestors {
         self.len() == 0
     }
 
+    pub fn min_slot(&self) -> Slot {
+        self.ancestors.min().unwrap_or_default()
+    }
+
     pub fn max_slot(&self) -> Slot {
-        self.ancestors.max() - 1
+        self.ancestors.max_exclusive().saturating_sub(1)
     }
 }
 #[cfg(test)]

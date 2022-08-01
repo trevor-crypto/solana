@@ -12,6 +12,13 @@
 //! * layer 2 - Everyone else, if layer 1 is `2^10`, layer 2 should be able to fit `2^20` number of nodes.
 //!
 //! Bank needs to provide an interface for us to query the stake weight
+
+#[deprecated(
+    since = "1.10.6",
+    note = "Please use `solana_net_utils::{MINIMUM_VALIDATOR_PORT_RANGE_WIDTH, VALIDATOR_PORT_RANGE}` instead"
+)]
+#[allow(deprecated)]
+pub use solana_net_utils::{MINIMUM_VALIDATOR_PORT_RANGE_WIDTH, VALIDATOR_PORT_RANGE};
 use {
     crate::{
         cluster_info_metrics::{
@@ -40,17 +47,13 @@ use {
     serde::ser::Serialize,
     solana_ledger::shred::Shred,
     solana_measure::measure::Measure,
-    solana_metrics::{inc_new_counter_debug, inc_new_counter_error},
     solana_net_utils::{
-        bind_common, bind_common_in_range, bind_in_range, find_available_port_in_range,
-        multi_bind_in_range, PortRange,
+        bind_common, bind_common_in_range, bind_in_range, bind_two_consecutive_in_range,
+        find_available_port_in_range, multi_bind_in_range, PortRange,
     },
     solana_perf::{
         data_budget::DataBudget,
-        packet::{
-            limited_deserialize, to_packet_batch_with_destination, Packet, PacketBatch,
-            PacketBatchRecycler, PACKET_DATA_SIZE,
-        },
+        packet::{Packet, PacketBatch, PacketBatchRecycler, PACKET_DATA_SIZE},
     },
     solana_rayon_threadlimit::get_thread_count,
     solana_runtime::{bank_forks::BankForks, vote_parser},
@@ -59,6 +62,7 @@ use {
         feature_set::FeatureSet,
         hash::Hash,
         pubkey::Pubkey,
+        quic::QUIC_PORT_OFFSET,
         sanitize::{Sanitize, SanitizeError},
         signature::{Keypair, Signable, Signature, Signer},
         timing::timestamp,
@@ -66,7 +70,6 @@ use {
     },
     solana_streamer::{
         packet,
-        sendmmsg::{multi_target_send, SendPktsError},
         socket::SocketAddrSpace,
         streamer::{PacketBatchReceiver, PacketBatchSender},
     },
@@ -90,9 +93,6 @@ use {
         time::{Duration, Instant},
     },
 };
-
-pub const VALIDATOR_PORT_RANGE: PortRange = (8000, 10_000);
-pub const MINIMUM_VALIDATOR_PORT_RANGE_WIDTH: u16 = 11; // VALIDATOR_PORT_RANGE must be at least this wide
 
 /// The Data plane fanout size, also used as the neighborhood size
 pub const DATA_PLANE_FANOUT: usize = 200;
@@ -218,16 +218,16 @@ impl Signable for PruneData {
 
     fn signable_data(&self) -> Cow<[u8]> {
         #[derive(Serialize)]
-        struct SignData {
-            pubkey: Pubkey,
-            prunes: Vec<Pubkey>,
-            destination: Pubkey,
+        struct SignData<'a> {
+            pubkey: &'a Pubkey,
+            prunes: &'a [Pubkey],
+            destination: &'a Pubkey,
             wallclock: u64,
         }
         let data = SignData {
-            pubkey: self.pubkey,
-            prunes: self.prunes.clone(),
-            destination: self.destination,
+            pubkey: &self.pubkey,
+            prunes: &self.prunes,
+            destination: &self.destination,
             wallclock: self.wallclock,
         };
         Cow::Owned(serialize(&data).expect("serialize PruneData"))
@@ -275,13 +275,13 @@ pub(crate) enum Protocol {
 }
 
 impl Protocol {
-    fn par_verify(self) -> Option<Self> {
+    fn par_verify(self, stats: &GossipStats) -> Option<Self> {
         match self {
             Protocol::PullRequest(_, ref caller) => {
                 if caller.verify() {
                     Some(self)
                 } else {
-                    inc_new_counter_info!("cluster_info-gossip_pull_request_verify_fail", 1);
+                    stats.gossip_pull_request_verify_fail.add_relaxed(1);
                     None
                 }
             }
@@ -289,10 +289,9 @@ impl Protocol {
                 let size = data.len();
                 let data: Vec<_> = data.into_par_iter().filter(Signable::verify).collect();
                 if size != data.len() {
-                    inc_new_counter_info!(
-                        "cluster_info-gossip_pull_response_verify_fail",
-                        size - data.len()
-                    );
+                    stats
+                        .gossip_pull_response_verify_fail
+                        .add_relaxed((size - data.len()) as u64);
                 }
                 if data.is_empty() {
                     None
@@ -304,10 +303,9 @@ impl Protocol {
                 let size = data.len();
                 let data: Vec<_> = data.into_par_iter().filter(Signable::verify).collect();
                 if size != data.len() {
-                    inc_new_counter_info!(
-                        "cluster_info-gossip_push_msg_verify_fail",
-                        size - data.len()
-                    );
+                    stats
+                        .gossip_push_msg_verify_fail
+                        .add_relaxed((size - data.len()) as u64);
                 }
                 if data.is_empty() {
                     None
@@ -319,7 +317,7 @@ impl Protocol {
                 if data.verify() {
                     Some(self)
                 } else {
-                    inc_new_counter_debug!("cluster_info-gossip_prune_msg_verify_fail", 1);
+                    stats.gossip_prune_msg_verify_fail.add_relaxed(1);
                     None
                 }
             }
@@ -327,7 +325,7 @@ impl Protocol {
                 if ping.verify() {
                     Some(self)
                 } else {
-                    inc_new_counter_info!("cluster_info-gossip_ping_msg_verify_fail", 1);
+                    stats.gossip_ping_msg_verify_fail.add_relaxed(1);
                     None
                 }
             }
@@ -335,7 +333,7 @@ impl Protocol {
                 if pong.verify() {
                     Some(self)
                 } else {
-                    inc_new_counter_info!("cluster_info-gossip_pong_msg_verify_fail", 1);
+                    stats.gossip_pong_msg_verify_fail.add_relaxed(1);
                     None
                 }
             }
@@ -634,6 +632,10 @@ impl ClusterInfo {
         self.my_contact_info.write().unwrap().id = id;
 
         self.insert_self();
+        self.push_message(CrdsValue::new_signed(
+            CrdsData::Version(Version::new(self.id())),
+            &self.keypair(),
+        ));
         self.push_self(&HashMap::new(), None);
     }
 
@@ -726,8 +728,8 @@ impl ClusterInfo {
         format!(
             "RPC Address       |Age(ms)| Node identifier                              \
              | Version | RPC  |PubSub|ShredVer\n\
-             ------------------+-------+----------------------------------------------+---------+\
-             ------+------+--------\n\
+             ------------------+-------+----------------------------------------------\
+             +---------+------+------+--------\n\
              {}\
              RPC Enabled Nodes: {}",
             nodes.join(""),
@@ -772,7 +774,7 @@ impl ClusterInfo {
                     };
                     let ip_addr = node.gossip.ip();
                     Some(format!(
-                        "{:15} {:2}| {:5} | {:44} |{:^9}| {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {}\n",
+                        "{:15} {:2}| {:5} | {:44} |{:^9}| {:5}|  {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {}\n",
                         if ContactInfo::is_valid_address(&node.gossip, &self.socket_addr_space) {
                             ip_addr.to_string()
                         } else {
@@ -803,8 +805,8 @@ impl ClusterInfo {
         format!(
             "IP Address        |Age(ms)| Node identifier                              \
              | Version |Gossip|TPUvote| TPU  |TPUfwd| TVU  |TVUfwd|Repair|ServeR|ShredVer\n\
-             ------------------+-------+----------------------------------------------+---------+\
-             ------+------+-------+------+------+------+------+------+--------\n\
+             ------------------+-------+----------------------------------------------\
+             +---------+------+-------+------+------+------+------+------+------+--------\n\
              {}\
              Nodes: {}{}{}",
             nodes.join(""),
@@ -858,7 +860,8 @@ impl ClusterInfo {
             (0..crds_value::MAX_EPOCH_SLOTS)
                 .filter_map(|ix| {
                     let label = CrdsValueLabel::EpochSlots(ix, self_pubkey);
-                    let epoch_slots = gossip_crds.get::<&CrdsValue>(&label)?.epoch_slots()?;
+                    let crds_value = gossip_crds.get::<&CrdsValue>(&label)?;
+                    let epoch_slots = crds_value.epoch_slots()?;
                     let first_slot = epoch_slots.first_slot()?;
                     Some((epoch_slots.wallclock, first_slot, ix))
                 })
@@ -875,7 +878,7 @@ impl ClusterInfo {
         if DEFAULT_SLOTS_PER_EPOCH as isize > total_slots
             && crds_value::MAX_EPOCH_SLOTS as usize <= current_slots.len()
         {
-            inc_new_counter_warn!("cluster_info-epoch_slots-filled", 1);
+            self.stats.epoch_slots_filled.add_relaxed(1);
             warn!(
                 "EPOCH_SLOTS are filling up FAST {}/{}",
                 total_slots,
@@ -1035,7 +1038,7 @@ impl ClusterInfo {
         };
         let vote_index = vote_index.unwrap_or(num_crds_votes);
         if (vote_index as usize) >= MAX_LOCKOUT_HISTORY {
-            let (_, vote, hash) = vote_parser::parse_vote_transaction(&vote).unwrap();
+            let (_, vote, hash, _) = vote_parser::parse_vote_transaction(&vote).unwrap();
             panic!(
                 "invalid vote index: {}, switch: {}, vote slots: {:?}, tower: {:?}",
                 vote_index,
@@ -1105,7 +1108,7 @@ impl ClusterInfo {
                 transaction
             })
             .collect();
-        inc_new_counter_info!("cluster_info-get_votes-count", txs.len());
+        self.stats.get_votes_count.add_relaxed(txs.len() as u64);
         txs
     }
 
@@ -1125,7 +1128,7 @@ impl ClusterInfo {
                 (vote.value.label(), transaction)
             })
             .unzip();
-        inc_new_counter_info!("cluster_info-get_votes-count", txs.len());
+        self.stats.get_votes_count.add_relaxed(txs.len() as u64);
         (labels, txs)
     }
 
@@ -1308,42 +1311,6 @@ impl ClusterInfo {
             .collect()
     }
 
-    /// retransmit messages to a list of nodes
-    /// # Remarks
-    /// We need to avoid having obj locked while doing a io, such as the `send_to`
-    pub fn retransmit_to(
-        peers: &[&ContactInfo],
-        data: &[u8],
-        s: &UdpSocket,
-        forwarded: bool,
-        socket_addr_space: &SocketAddrSpace,
-    ) {
-        trace!("retransmit orders {}", peers.len());
-        let dests: Vec<_> = if forwarded {
-            peers
-                .iter()
-                .map(|peer| peer.tvu_forwards)
-                .filter(|addr| ContactInfo::is_valid_address(addr, socket_addr_space))
-                .collect()
-        } else {
-            peers
-                .iter()
-                .map(|peer| peer.tvu)
-                .filter(|addr| socket_addr_space.check(addr))
-                .collect()
-        };
-        if let Err(SendPktsError::IoError(ioerr, num_failed)) = multi_target_send(s, data, &dests) {
-            inc_new_counter_info!("cluster_info-retransmit-packets", dests.len(), 1);
-            inc_new_counter_error!("cluster_info-retransmit-error", num_failed, 1);
-            error!(
-                "retransmit_to multi_target_send error: {:?}, {}/{} packets failed",
-                ioerr,
-                num_failed,
-                dests.len(),
-            );
-        }
-    }
-
     fn insert_self(&self) {
         let value = CrdsValue::new_signed(
             CrdsData::ContactInfo(self.my_contact_info()),
@@ -1357,7 +1324,7 @@ impl ClusterInfo {
     fn append_entrypoint_to_pulls(
         &self,
         thread_pool: &ThreadPool,
-        pulls: &mut Vec<(ContactInfo, Vec<CrdsFilter>)>,
+        pulls: &mut HashMap<ContactInfo, Vec<CrdsFilter>>,
     ) {
         const THROTTLE_DELAY: u64 = CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS / 2;
         let entrypoint = {
@@ -1382,17 +1349,16 @@ impl ClusterInfo {
             }
             entrypoint.clone()
         };
-        let filters = match pulls.first() {
-            Some((_, filters)) => filters.clone(),
-            None => {
-                let _st = ScopedTimer::from(&self.stats.entrypoint2);
-                self.gossip
-                    .pull
-                    .build_crds_filters(thread_pool, &self.gossip.crds, MAX_BLOOM_SIZE)
-            }
+        let filters = if pulls.is_empty() {
+            let _st = ScopedTimer::from(&self.stats.entrypoint2);
+            self.gossip
+                .pull
+                .build_crds_filters(thread_pool, &self.gossip.crds, MAX_BLOOM_SIZE)
+        } else {
+            pulls.values().flatten().cloned().collect()
         };
         self.stats.pull_from_entrypoint_count.add_relaxed(1);
-        pulls.push((entrypoint, filters));
+        pulls.insert(entrypoint, filters);
     }
 
     /// Splits an input feed of serializable data into chunks where the sum of
@@ -1457,30 +1423,29 @@ impl ClusterInfo {
     ) {
         let now = timestamp();
         let mut pings = Vec::new();
-        let mut pulls: Vec<_> = {
+        let mut pulls = {
             let _st = ScopedTimer::from(&self.stats.new_pull_requests);
-            match self.gossip.new_pull_request(
-                thread_pool,
-                self.keypair().deref(),
-                self.my_shred_version(),
-                now,
-                gossip_validators,
-                stakes,
-                MAX_BLOOM_SIZE,
-                &self.ping_cache,
-                &mut pings,
-                &self.socket_addr_space,
-            ) {
-                Err(_) => Vec::default(),
-                Ok((peer, filters)) => vec![(peer, filters)],
-            }
+            self.gossip
+                .new_pull_request(
+                    thread_pool,
+                    self.keypair().deref(),
+                    self.my_shred_version(),
+                    now,
+                    gossip_validators,
+                    stakes,
+                    MAX_BLOOM_SIZE,
+                    &self.ping_cache,
+                    &mut pings,
+                    &self.socket_addr_space,
+                )
+                .unwrap_or_default()
         };
         self.append_entrypoint_to_pulls(thread_pool, &mut pulls);
-        let num_requests = pulls.iter().map(|(_, filters)| filters.len() as u64).sum();
+        let num_requests = pulls.values().map(Vec::len).sum::<usize>() as u64;
         self.stats.new_pull_requests_count.add_relaxed(num_requests);
         {
             let _st = ScopedTimer::from(&self.stats.mark_pull_request);
-            for (peer, _) in &pulls {
+            for peer in pulls.keys() {
                 self.gossip.mark_pull_request_creation_time(peer.id, now);
             }
         }
@@ -1591,6 +1556,7 @@ impl ClusterInfo {
         sender: &PacketBatchSender,
         generate_pull_requests: bool,
     ) -> Result<(), GossipError> {
+        let _st = ScopedTimer::from(&self.stats.gossip_transmit_loop_time);
         let reqs = self.generate_new_gossip_requests(
             thread_pool,
             gossip_validators,
@@ -1598,12 +1564,19 @@ impl ClusterInfo {
             generate_pull_requests,
         );
         if !reqs.is_empty() {
-            let packet_batch = to_packet_batch_with_destination(recycler.clone(), &reqs);
+            let packet_batch = PacketBatch::new_unpinned_with_recycler_data_and_dests(
+                recycler.clone(),
+                "run_gossip",
+                &reqs,
+            );
             self.stats
                 .packets_sent_gossip_requests_count
-                .add_relaxed(packet_batch.packets.len() as u64);
+                .add_relaxed(packet_batch.len() as u64);
             sender.send(packet_batch)?;
         }
+        self.stats
+            .gossip_transmit_loop_iterations_since_last_report
+            .add_relaxed(1);
         Ok(())
     }
 
@@ -1650,7 +1623,7 @@ impl ClusterInfo {
         stakes: &HashMap<Pubkey, u64>,
     ) {
         let self_pubkey = self.id();
-        let epoch_duration = get_epoch_duration(bank_forks);
+        let epoch_duration = get_epoch_duration(bank_forks, &self.stats);
         let timeouts = self
             .gossip
             .make_timeouts(self_pubkey, stakes, epoch_duration);
@@ -1659,7 +1632,7 @@ impl ClusterInfo {
             self.gossip
                 .purge(&self_pubkey, thread_pool, timestamp(), &timeouts)
         };
-        inc_new_counter_info!("cluster_info-purge-count", num_purged);
+        self.stats.purge_count.add_relaxed(num_purged as u64);
     }
 
     // Trims the CRDS table by dropping all values associated with the pubkeys
@@ -1826,10 +1799,14 @@ impl ClusterInfo {
             }
         }
         if prune_message_timeout != 0 {
-            inc_new_counter_debug!("cluster_info-prune_message_timeout", prune_message_timeout);
+            self.stats
+                .prune_message_timeout
+                .add_relaxed(prune_message_timeout);
         }
         if bad_prune_destination != 0 {
-            inc_new_counter_debug!("cluster_info-bad_prune_destination", bad_prune_destination);
+            self.stats
+                .bad_prune_destination
+                .add_relaxed(bad_prune_destination);
         }
     }
 
@@ -1855,7 +1832,7 @@ impl ClusterInfo {
                     None => false,
                     Some(caller) if caller.id == self_pubkey => {
                         warn!("PullRequest ignored, I'm talking to myself");
-                        inc_new_counter_debug!("cluster_info-window-request-loopback", 1);
+                        self.stats.window_request_loopback.add_relaxed(1);
                         false
                     }
                     Some(_) => true,
@@ -1875,7 +1852,7 @@ impl ClusterInfo {
             if !response.is_empty() {
                 self.stats
                     .packets_sent_pull_responses_count
-                    .add_relaxed(response.packets.len() as u64);
+                    .add_relaxed(response.len() as u64);
                 let _ = response_sender.send(response);
             }
         }
@@ -1915,7 +1892,7 @@ impl ClusterInfo {
             if let Some(ping) = ping {
                 let ping = Protocol::PingMessage(ping);
                 match Packet::from_data(Some(&node.1), ping) {
-                    Ok(packet) => packet_batch.packets.push(packet),
+                    Ok(packet) => packet_batch.push(packet),
                     Err(err) => error!("failed to write ping packet: {:?}", err),
                 };
             }
@@ -1926,7 +1903,7 @@ impl ClusterInfo {
             }
             check
         };
-        // Because pull-responses are sent back to packet.meta.addr() of
+        // Because pull-responses are sent back to packet.meta.socket_addr() of
         // incoming pull-requests, pings are also sent to request.from_addr (as
         // opposed to caller.gossip address).
         move |request| {
@@ -1977,6 +1954,7 @@ impl ClusterInfo {
                 &caller_and_filters,
                 output_size_limit,
                 now,
+                &self.stats,
             )
         };
         if self.require_stake_for_gossip(stakes) {
@@ -2010,7 +1988,7 @@ impl ClusterInfo {
             return packet_batch;
         }
         let mut rng = rand::thread_rng();
-        let shuffle = WeightedShuffle::new(&mut rng, &scores).unwrap();
+        let shuffle = WeightedShuffle::new("handle-pull-requests", &scores).shuffle(&mut rng);
         let mut total_bytes = 0;
         let mut sent = 0;
         for (addr, response) in shuffle.map(|i| &responses[i]) {
@@ -2021,10 +1999,10 @@ impl ClusterInfo {
                 Ok(packet) => {
                     if self.outbound_budget.take(packet.meta.size) {
                         total_bytes += packet.meta.size;
-                        packet_batch.packets.push(packet);
+                        packet_batch.push(packet);
                         sent += 1;
                     } else {
-                        inc_new_counter_info!("gossip_pull_request-no_budget", 1);
+                        self.stats.gossip_pull_request_no_budget.add_relaxed(1);
                         break;
                     }
                 }
@@ -2032,8 +2010,12 @@ impl ClusterInfo {
         }
         time.stop();
         let dropped_responses = responses.len() - sent;
-        inc_new_counter_info!("gossip_pull_request-sent_requests", sent);
-        inc_new_counter_info!("gossip_pull_request-dropped_requests", dropped_responses);
+        self.stats
+            .gossip_pull_request_sent_requests
+            .add_relaxed(sent as u64);
+        self.stats
+            .gossip_pull_request_dropped_requests
+            .add_relaxed(dropped_responses as u64);
         debug!(
             "handle_pull_requests: {} sent: {} total: {} total_bytes: {}",
             time,
@@ -2182,27 +2164,21 @@ impl ClusterInfo {
         I: IntoIterator<Item = (SocketAddr, Ping)>,
     {
         let keypair = self.keypair();
-        let packets: Vec<_> = pings
+        let pongs_and_dests: Vec<_> = pings
             .into_iter()
             .filter_map(|(addr, ping)| {
                 let pong = Pong::new(&ping, &keypair).ok()?;
                 let pong = Protocol::PongMessage(pong);
-                match Packet::from_data(Some(&addr), pong) {
-                    Ok(packet) => Some(packet),
-                    Err(err) => {
-                        error!("failed to write pong packet: {:?}", err);
-                        None
-                    }
-                }
+                Some((addr, pong))
             })
             .collect();
-        if packets.is_empty() {
+        if pongs_and_dests.is_empty() {
             None
         } else {
-            let packet_batch = PacketBatch::new_unpinned_with_recycler_data(
-                recycler,
+            let packet_batch = PacketBatch::new_unpinned_with_recycler_data_and_dests(
+                recycler.clone(),
                 "handle_ping_messages",
-                packets,
+                &pongs_and_dests,
             );
             Some(packet_batch)
         }
@@ -2306,17 +2282,23 @@ impl ClusterInfo {
         if prune_messages.is_empty() {
             return;
         }
-        let mut packet_batch = to_packet_batch_with_destination(recycler.clone(), &prune_messages);
-        let num_prune_packets = packet_batch.packets.len();
+        let mut packet_batch = PacketBatch::new_unpinned_with_recycler_data_and_dests(
+            recycler.clone(),
+            "handle_batch_push_messages",
+            &prune_messages,
+        );
+        let num_prune_packets = packet_batch.len();
         self.stats
             .push_response_count
-            .add_relaxed(packet_batch.packets.len() as u64);
+            .add_relaxed(packet_batch.len() as u64);
         let new_push_requests = self.new_push_requests(stakes);
-        inc_new_counter_debug!("cluster_info-push_message-pushes", new_push_requests.len());
+        self.stats
+            .push_message_pushes
+            .add_relaxed(new_push_requests.len() as u64);
         for (address, request) in new_push_requests {
             if ContactInfo::is_valid_address(&address, &self.socket_addr_space) {
                 match Packet::from_data(Some(&address), &request) {
-                    Ok(packet) => packet_batch.packets.push(packet),
+                    Ok(packet) => packet_batch.push(packet),
                     Err(err) => error!("failed to write push-request packet: {:?}", err),
                 }
             } else {
@@ -2328,7 +2310,7 @@ impl ClusterInfo {
             .add_relaxed(num_prune_packets as u64);
         self.stats
             .packets_sent_push_messages_count
-            .add_relaxed((packet_batch.packets.len() - num_prune_packets) as u64);
+            .add_relaxed((packet_batch.len() - num_prune_packets) as u64);
         let _ = response_sender.send(packet_batch);
     }
 
@@ -2457,6 +2439,9 @@ impl ClusterInfo {
             stakes,
             response_sender,
         );
+        self.stats
+            .process_gossip_packets_iterations_since_last_report
+            .add_relaxed(1);
         Ok(())
     }
 
@@ -2470,10 +2455,10 @@ impl ClusterInfo {
         thread_pool: &ThreadPool,
     ) -> Result<(), GossipError> {
         const RECV_TIMEOUT: Duration = Duration::from_secs(1);
-        let packets: Vec<_> = receiver.recv_timeout(RECV_TIMEOUT)?.packets.into();
+        let packets: Vec<_> = receiver.recv_timeout(RECV_TIMEOUT)?.into();
         let mut packets = VecDeque::from(packets);
         for packet_batch in receiver.try_iter() {
-            packets.extend(packet_batch.packets.iter().cloned());
+            packets.extend(packet_batch.iter().cloned());
             let excess_count = packets.len().saturating_sub(MAX_GOSSIP_TRAFFIC);
             if excess_count > 0 {
                 packets.drain(0..excess_count);
@@ -2486,11 +2471,10 @@ impl ClusterInfo {
             .packets_received_count
             .add_relaxed(packets.len() as u64);
         let verify_packet = |packet: Packet| {
-            let data = &packet.data[..packet.meta.size];
-            let protocol: Protocol = limited_deserialize(data).ok()?;
+            let protocol: Protocol = packet.deserialize_slice(..).ok()?;
             protocol.sanitize().ok()?;
-            let protocol = protocol.par_verify()?;
-            Some((packet.meta.addr(), protocol))
+            let protocol = protocol.par_verify(&self.stats)?;
+            Some((packet.meta.socket_addr(), protocol))
         };
         let packets: Vec<_> = {
             let _st = ScopedTimer::from(&self.stats.verify_gossip_packets_time);
@@ -2513,6 +2497,7 @@ impl ClusterInfo {
         last_print: &mut Instant,
         should_check_duplicate_instance: bool,
     ) -> Result<(), GossipError> {
+        let _st = ScopedTimer::from(&self.stats.gossip_listen_loop_time);
         const RECV_TIMEOUT: Duration = Duration::from_secs(1);
         const SUBMIT_GOSSIP_STATS_INTERVAL: Duration = Duration::from_secs(2);
         let mut packets = VecDeque::from(receiver.recv_timeout(RECV_TIMEOUT)?);
@@ -2544,13 +2529,16 @@ impl ClusterInfo {
             response_sender,
             &stakes,
             feature_set.as_deref(),
-            get_epoch_duration(bank_forks),
+            get_epoch_duration(bank_forks, &self.stats),
             should_check_duplicate_instance,
         )?;
         if last_print.elapsed() > SUBMIT_GOSSIP_STATS_INTERVAL {
             submit_gossip_stats(&self.stats, &self.gossip, &stakes);
             *last_print = Instant::now();
         }
+        self.stats
+            .gossip_listen_loop_iterations_since_last_report
+            .add_relaxed(1);
         Ok(())
     }
 
@@ -2679,10 +2667,10 @@ impl ClusterInfo {
 // Returns root bank's epoch duration. Falls back on
 //     DEFAULT_SLOTS_PER_EPOCH * DEFAULT_MS_PER_SLOT
 // if there are no working banks.
-fn get_epoch_duration(bank_forks: Option<&RwLock<BankForks>>) -> Duration {
+fn get_epoch_duration(bank_forks: Option<&RwLock<BankForks>>, stats: &GossipStats) -> Duration {
     let num_slots = match bank_forks {
         None => {
-            inc_new_counter_info!("cluster_info-purge-no_working_bank", 1);
+            stats.get_epoch_duration_no_working_bank.add_relaxed(1);
             DEFAULT_SLOTS_PER_EPOCH
         }
         Some(bank_forks) => {
@@ -2741,6 +2729,8 @@ pub struct Sockets {
     pub retransmit_sockets: Vec<UdpSocket>,
     pub serve_repair: UdpSocket,
     pub ancestor_hashes_requests: UdpSocket,
+    pub tpu_quic: UdpSocket,
+    pub tpu_forwards_quic: UdpSocket,
 }
 
 #[derive(Debug)]
@@ -2756,13 +2746,15 @@ impl Node {
     }
     pub fn new_localhost_with_pubkey(pubkey: &Pubkey) -> Self {
         let bind_ip_addr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
-        let tpu = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let ((_tpu_port, tpu), (_tpu_quic_port, tpu_quic)) =
+            bind_two_consecutive_in_range(bind_ip_addr, (1024, 65535)).unwrap();
         let (gossip_port, (gossip, ip_echo)) =
             bind_common_in_range(bind_ip_addr, (1024, 65535)).unwrap();
         let gossip_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), gossip_port);
         let tvu = UdpSocket::bind("127.0.0.1:0").unwrap();
         let tvu_forwards = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let tpu_forwards = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let ((_tpu_forwards_port, tpu_forwards), (_tpu_forwards_quic_port, tpu_forwards_quic)) =
+            bind_two_consecutive_in_range(bind_ip_addr, (1024, 65535)).unwrap();
         let tpu_vote = UdpSocket::bind("127.0.0.1:0").unwrap();
         let repair = UdpSocket::bind("127.0.0.1:0").unwrap();
         let rpc_port = find_available_port_in_range(bind_ip_addr, (1024, 65535)).unwrap();
@@ -2806,6 +2798,8 @@ impl Node {
                 retransmit_sockets: vec![retransmit_socket],
                 serve_repair,
                 ancestor_hashes_requests,
+                tpu_quic,
+                tpu_forwards_quic,
             },
         }
     }
@@ -2840,8 +2834,10 @@ impl Node {
             Self::get_gossip_port(gossip_addr, port_range, bind_ip_addr);
         let (tvu_port, tvu) = Self::bind(bind_ip_addr, port_range);
         let (tvu_forwards_port, tvu_forwards) = Self::bind(bind_ip_addr, port_range);
-        let (tpu_port, tpu) = Self::bind(bind_ip_addr, port_range);
-        let (tpu_forwards_port, tpu_forwards) = Self::bind(bind_ip_addr, port_range);
+        let ((tpu_port, tpu), (_tpu_quic_port, tpu_quic)) =
+            bind_two_consecutive_in_range(bind_ip_addr, port_range).unwrap();
+        let ((tpu_forwards_port, tpu_forwards), (_tpu_forwards_quic_port, tpu_forwards_quic)) =
+            bind_two_consecutive_in_range(bind_ip_addr, port_range).unwrap();
         let (tpu_vote_port, tpu_vote) = Self::bind(bind_ip_addr, port_range);
         let (_, retransmit_socket) = Self::bind(bind_ip_addr, port_range);
         let (repair_port, repair) = Self::bind(bind_ip_addr, port_range);
@@ -2884,6 +2880,8 @@ impl Node {
                 retransmit_sockets: vec![retransmit_socket],
                 serve_repair,
                 ancestor_hashes_requests,
+                tpu_quic,
+                tpu_forwards_quic,
             },
         }
     }
@@ -2893,6 +2891,7 @@ impl Node {
         gossip_addr: &SocketAddr,
         port_range: PortRange,
         bind_ip_addr: IpAddr,
+        overwrite_tpu_addr: Option<SocketAddr>,
     ) -> Node {
         let (gossip_port, (gossip, ip_echo)) =
             Self::get_gossip_port(gossip_addr, port_range, bind_ip_addr);
@@ -2906,8 +2905,21 @@ impl Node {
         let (tpu_port, tpu_sockets) =
             multi_bind_in_range(bind_ip_addr, port_range, 32).expect("tpu multi_bind");
 
+        let (_tpu_port_quic, tpu_quic) = Self::bind(
+            bind_ip_addr,
+            (tpu_port + QUIC_PORT_OFFSET, tpu_port + QUIC_PORT_OFFSET + 1),
+        );
+
         let (tpu_forwards_port, tpu_forwards_sockets) =
             multi_bind_in_range(bind_ip_addr, port_range, 8).expect("tpu_forwards multi_bind");
+
+        let (_tpu_forwards_port_quic, tpu_forwards_quic) = Self::bind(
+            bind_ip_addr,
+            (
+                tpu_forwards_port + QUIC_PORT_OFFSET,
+                tpu_forwards_port + QUIC_PORT_OFFSET + 1,
+            ),
+        );
 
         let (tpu_vote_port, tpu_vote_sockets) =
             multi_bind_in_range(bind_ip_addr, port_range, 1).expect("tpu_vote multi_bind");
@@ -2929,7 +2941,7 @@ impl Node {
             tvu: SocketAddr::new(gossip_addr.ip(), tvu_port),
             tvu_forwards: SocketAddr::new(gossip_addr.ip(), tvu_forwards_port),
             repair: SocketAddr::new(gossip_addr.ip(), repair_port),
-            tpu: SocketAddr::new(gossip_addr.ip(), tpu_port),
+            tpu: overwrite_tpu_addr.unwrap_or_else(|| SocketAddr::new(gossip_addr.ip(), tpu_port)),
             tpu_forwards: SocketAddr::new(gossip_addr.ip(), tpu_forwards_port),
             tpu_vote: SocketAddr::new(gossip_addr.ip(), tpu_vote_port),
             rpc: socketaddr_any!(),
@@ -2955,6 +2967,8 @@ impl Node {
                 serve_repair,
                 ip_echo: Some(ip_echo),
                 ancestor_hashes_requests,
+                tpu_quic,
+                tpu_forwards_quic,
             },
         }
     }
@@ -2969,7 +2983,11 @@ pub fn push_messages_to_peer(
     let reqs: Vec<_> = ClusterInfo::split_gossip_messages(PUSH_MESSAGE_MAX_PAYLOAD_SIZE, messages)
         .map(move |payload| (peer_gossip, Protocol::PushMessage(self_id, payload)))
         .collect();
-    let packet_batch = to_packet_batch_with_destination(PacketBatchRecycler::default(), &reqs);
+    let packet_batch = PacketBatch::new_unpinned_with_recycler_data_and_dests(
+        PacketBatchRecycler::default(),
+        "push_messages_to_peer",
+        &reqs,
+    );
     let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
     packet::send_to(&packet_batch, &sock, socket_addr_space)?;
     Ok(())
@@ -3057,7 +3075,9 @@ mod tests {
         itertools::izip,
         rand::{seq::SliceRandom, SeedableRng},
         rand_chacha::ChaChaRng,
+        regex::Regex,
         solana_ledger::shred::Shredder,
+        solana_net_utils::MINIMUM_VALIDATOR_PORT_RANGE_WIDTH,
         solana_sdk::signature::{Keypair, Signer},
         solana_vote_program::{vote_instruction, vote_state::Vote},
         std::{
@@ -3084,6 +3104,91 @@ mod tests {
             &node,
             &SocketAddrSpace::Unspecified
         ));
+    }
+
+    #[test]
+    fn test_cluster_info_trace() {
+        solana_logger::setup();
+        let keypair = Keypair::from_base58_string("3jATNWfbii1btv6nCpToAXAJz6a4km5HsLSWiwLfNvHNQAmvksLFVAKGUz286bXb9N4ivXx8nuwkn91PFDTyoFEp");
+
+        let node = {
+            let tpu = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8900);
+            let _tpu_quic = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8901);
+
+            let gossip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8888);
+            let tvu = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8902);
+            let tvu_forwards = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8903);
+            let tpu_forwards = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8904);
+
+            let tpu_vote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8906);
+            let repair = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8907);
+            let rpc = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8908);
+            let rpc_pubsub = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8909);
+
+            let serve_repair = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8910);
+
+            let info = ContactInfo {
+                id: keypair.pubkey(),
+                gossip,
+                tvu,
+                tvu_forwards,
+                repair,
+                tpu,
+                tpu_forwards,
+                tpu_vote,
+                rpc,
+                rpc_pubsub,
+                serve_repair,
+                wallclock: timestamp(),
+                shred_version: 0,
+            };
+            Node {
+                info,
+                sockets: Sockets {
+                    gossip: UdpSocket::bind("0.0.0.0:0").unwrap(),
+                    ip_echo: None,
+                    tvu: vec![],
+                    tvu_forwards: vec![],
+                    tpu: vec![],
+                    tpu_forwards: vec![],
+                    tpu_vote: vec![],
+                    broadcast: vec![],
+                    repair: UdpSocket::bind("0.0.0.0:0").unwrap(),
+                    retransmit_sockets: vec![],
+                    serve_repair: UdpSocket::bind("0.0.0.0:0").unwrap(),
+                    ancestor_hashes_requests: UdpSocket::bind("0.0.0.0:0").unwrap(),
+                    tpu_quic: UdpSocket::bind("0.0.0.0:0").unwrap(),
+                    tpu_forwards_quic: UdpSocket::bind("0.0.0.0:0").unwrap(),
+                },
+            }
+        };
+
+        let cluster_info = Arc::new(ClusterInfo::new(
+            node.info,
+            Arc::new(keypair),
+            SocketAddrSpace::Unspecified,
+        ));
+
+        let golden = r#"
+IP Address        |Age(ms)| Node identifier                              | Version |Gossip|TPUvote| TPU  |TPUfwd| TVU  |TVUfwd|Repair|ServeR|ShredVer
+------------------+-------+----------------------------------------------+---------+------+-------+------+------+------+------+------+------+--------
+127.0.0.1       me|     \d | 7fGBVaezz2YrTxAkwvLjBZpxrGEfNsd14Jxw9W5Df5zY |    -    | 8888 |  8906 | 8900 | 8904 | 8902 | 8903 | 8907 | 8910 | 0
+Nodes: 1
+
+RPC Address       |Age(ms)| Node identifier                              | Version | RPC  |PubSub|ShredVer
+------------------+-------+----------------------------------------------+---------+------+------+--------
+127.0.0.1       me|     \d | 7fGBVaezz2YrTxAkwvLjBZpxrGEfNsd14Jxw9W5Df5zY |    -    | 8908 | 8909 | 0
+RPC Enabled Nodes: 1"#;
+
+        let re = Regex::new(golden).unwrap();
+
+        let output = format!(
+            "\n{}\n\n{}",
+            cluster_info.contact_info_trace(),
+            cluster_info.rpc_info_trace()
+        );
+
+        assert!(re.is_match(&output));
     }
 
     #[test]
@@ -3229,17 +3334,16 @@ mod tests {
                     .zip(pings.into_iter()),
                 &recycler,
             )
-            .unwrap()
-            .packets;
+            .unwrap();
         assert_eq!(remote_nodes.len(), packets.len());
         for (packet, (_, socket), pong) in izip!(
             packets.into_iter(),
             remote_nodes.into_iter(),
             pongs.into_iter()
         ) {
-            assert_eq!(packet.meta.addr(), socket);
+            assert_eq!(packet.meta.socket_addr(), socket);
             let bytes = serialize(&pong).unwrap();
-            match limited_deserialize(&packet.data[..packet.meta.size]).unwrap() {
+            match packet.deserialize_slice(..).unwrap() {
                 Protocol::PongMessage(pong) => assert_eq!(serialize(&pong).unwrap(), bytes),
                 _ => panic!("invalid packet!"),
             }
@@ -3350,9 +3454,12 @@ mod tests {
         let keypair = Keypair::new();
         let (slot, parent_slot, reference_tick, version) = (53084024, 53084023, 0, 0);
         let shredder = Shredder::new(slot, parent_slot, reference_tick, version).unwrap();
-        let next_shred_index = rng.gen();
+        let next_shred_index = rng.gen_range(0, 32_000);
         let shred = new_rand_shred(&mut rng, next_shred_index, &shredder, &leader);
-        let other_payload = new_rand_shred(&mut rng, next_shred_index, &shredder, &leader).payload;
+        let other_payload = {
+            let other_shred = new_rand_shred(&mut rng, next_shred_index, &shredder, &leader);
+            other_shred.into_payload()
+        };
         let leader_schedule = |s| {
             if s == slot {
                 Some(leader.pubkey())
@@ -3488,6 +3595,7 @@ mod tests {
             &socketaddr!(ip, 0),
             VALIDATOR_PORT_RANGE,
             IpAddr::V4(ip),
+            None,
         );
 
         check_node_sockets(&node, IpAddr::V4(ip), VALIDATOR_PORT_RANGE);
@@ -3509,6 +3617,7 @@ mod tests {
             &socketaddr!(0, port),
             port_range,
             ip,
+            None,
         );
 
         check_node_sockets(&node, ip, port_range);
@@ -3765,6 +3874,9 @@ mod tests {
         tower.push(slot);
         tower.remove(23);
         let vote = new_vote_transaction(&mut rng, vec![slot]);
+        // New versioned-crds-value should have wallclock later than existing
+        // entries, otherwise might not get inserted into the table.
+        sleep(Duration::from_millis(5));
         cluster_info.push_vote(&tower, vote);
         let vote_slots = get_vote_slots(&cluster_info);
         assert_eq!(vote_slots.len(), MAX_LOCKOUT_HISTORY);
@@ -4085,15 +4197,15 @@ mod tests {
         let (pings, pulls) = cluster_info.new_pull_requests(&thread_pool, None, &stakes);
         assert!(pings.is_empty());
         assert_eq!(pulls.len(), 2 * MIN_NUM_BLOOM_FILTERS);
-        assert!(pulls
-            .iter()
-            .take(MIN_NUM_BLOOM_FILTERS)
-            .all(|(addr, _)| *addr == other_node.gossip));
-        assert!(pulls
-            .iter()
-            .skip(MIN_NUM_BLOOM_FILTERS)
-            .all(|(addr, _)| *addr == entrypoint.gossip));
-
+        for node in [&other_node, &entrypoint] {
+            assert_eq!(
+                pulls
+                    .iter()
+                    .filter(|(addr, _)| *addr == node.gossip)
+                    .count(),
+                MIN_NUM_BLOOM_FILTERS
+            );
+        }
         // Pull request 3:  `other_node` is present and `entrypoint` was just pulled from.  There should
         // only be one pull request to `other_node`
         let (pings, pulls) = cluster_info.new_pull_requests(&thread_pool, None, &stakes);
@@ -4530,8 +4642,9 @@ mod tests {
 
     #[test]
     fn test_get_epoch_millis_no_bank() {
+        let epoch_duration = get_epoch_duration(/*bank_forks:*/ None, &GossipStats::default());
         assert_eq!(
-            get_epoch_duration(/*bank_forks=*/ None).as_millis() as u64,
+            epoch_duration.as_millis() as u64,
             DEFAULT_SLOTS_PER_EPOCH * DEFAULT_MS_PER_SLOT // 48 hours
         );
     }

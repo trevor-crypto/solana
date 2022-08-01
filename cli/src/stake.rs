@@ -21,8 +21,9 @@ use {
         ArgConstant,
     },
     solana_cli_output::{
-        return_signers_with_config, CliEpochReward, CliStakeHistory, CliStakeHistoryEntry,
-        CliStakeState, CliStakeType, OutputFormat, ReturnSignersConfig,
+        self, display::BuildBalanceMessageConfig, return_signers_with_config, CliBalance,
+        CliEpochReward, CliStakeHistory, CliStakeHistoryEntry, CliStakeState, CliStakeType,
+        OutputFormat, ReturnSignersConfig,
     },
     solana_client::{
         blockhash_query::BlockhashQuery, nonce_utils, rpc_client::RpcClient,
@@ -41,6 +42,7 @@ use {
             self,
             instruction::{self as stake_instruction, LockupArgs, StakeError},
             state::{Authorized, Lockup, Meta, StakeActivationStatus, StakeAuthorize, StakeState},
+            tools::{acceptable_reference_epoch_credits, eligible_for_deactivate_delinquent},
         },
         stake_history::StakeHistory,
         system_instruction::SystemError,
@@ -102,7 +104,7 @@ pub(crate) struct StakeAuthorization {
     authority_pubkey: Option<Pubkey>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct StakeAuthorizationIndexed {
     pub authorization_type: StakeAuthorize,
     pub new_authority_pubkey: Pubkey,
@@ -284,6 +286,51 @@ impl StakeSubCommands for App<'_, '_> {
                 .arg(memo_arg())
         )
         .subcommand(
+            SubCommand::with_name("redelegate-stake")
+                .about("Redelegate active stake to another vote account")
+                .arg(
+                    Arg::with_name("force")
+                        .long("force")
+                        .takes_value(false)
+                        .hidden(true) // Don't document this argument to discourage its use
+                        .help("Override vote account sanity checks (use carefully!)")
+                )
+                .arg(
+                    pubkey!(Arg::with_name("stake_account_pubkey")
+                        .index(1)
+                        .value_name("STAKE_ACCOUNT_ADDRESS")
+                        .required(true),
+                        "Existing delegated stake account that has been fully activated. \
+                        On success this stake account will be scheduled for deactivation and the rent-exempt balance \
+                        may be withdrawn once fully deactivated")
+                )
+                .arg(
+                    pubkey!(Arg::with_name("vote_account_pubkey")
+                        .index(2)
+                        .value_name("REDELEGATED_VOTE_ACCOUNT_ADDRESS")
+                        .required(true),
+                        "The vote account to which the stake will be redelegated")
+                )
+                .arg(
+                    Arg::with_name("redelegation_stake_account")
+                        .index(3)
+                        .value_name("REDELEGATION_STAKE_ACCOUNT")
+                        .takes_value(true)
+                        .required(true)
+                        .validator(is_valid_signer)
+                        .help("Stake account to create for the redelegation. \
+                               On success this stake account will be created and scheduled for activation with all \
+                               the stake in the existing stake account, exclusive of the rent-exempt balance retained \
+                               in the existing account")
+                )
+                .arg(stake_authority_arg())
+                .offline_args()
+                .nonce_args(false)
+                .arg(fee_payer_arg())
+                .arg(memo_arg())
+        )
+
+        .subcommand(
             SubCommand::with_name("stake-authorize")
                 .about("Authorize a new signing keypair for the given stake account")
                 .arg(
@@ -378,6 +425,13 @@ impl StakeSubCommands for App<'_, '_> {
                         .takes_value(true)
                         .help("Seed for address generation; if specified, the resulting account \
                                will be at a derived address of STAKE_ACCOUNT_ADDRESS")
+                )
+                .arg(
+                    Arg::with_name("delinquent")
+                        .long("delinquent")
+                        .takes_value(false)
+                        .conflicts_with(SIGN_ONLY_ARG.name)
+                        .help("Deactivate abandoned stake that is currently delegated to a delinquent vote account")
                 )
                 .arg(stake_authority_arg())
                 .offline_args()
@@ -648,6 +702,16 @@ impl StakeSubCommands for App<'_, '_> {
                         .help("Display NUM recent epochs worth of stake history in text mode. 0 for all")
                 )
         )
+        .subcommand(
+            SubCommand::with_name("stake-minimum-delegation")
+                .about("Get the stake minimum delegation amount")
+                .arg(
+                    Arg::with_name("lamports")
+                        .long("lamports")
+                        .takes_value(false)
+                        .help("Display minimum delegation in lamports instead of SOL")
+                )
+        )
     }
 }
 
@@ -734,6 +798,8 @@ pub fn parse_stake_delegate_stake(
         pubkey_of_signer(matches, "stake_account_pubkey", wallet_manager)?.unwrap();
     let vote_account_pubkey =
         pubkey_of_signer(matches, "vote_account_pubkey", wallet_manager)?.unwrap();
+    let (redelegation_stake_account, redelegation_stake_account_pubkey) =
+        signer_of(matches, "redelegation_stake_account", wallet_manager)?;
     let force = matches.is_present("force");
     let sign_only = matches.is_present(SIGN_ONLY_ARG.name);
     let dump_transaction_message = matches.is_present(DUMP_TRANSACTION_MESSAGE.name);
@@ -746,7 +812,7 @@ pub fn parse_stake_delegate_stake(
         signer_of(matches, NONCE_AUTHORITY_ARG.name, wallet_manager)?;
     let (fee_payer, fee_payer_pubkey) = signer_of(matches, FEE_PAYER_ARG.name, wallet_manager)?;
 
-    let mut bulk_signers = vec![stake_authority, fee_payer];
+    let mut bulk_signers = vec![stake_authority, fee_payer, redelegation_stake_account];
     if nonce_account.is_some() {
         bulk_signers.push(nonce_authority);
     }
@@ -766,6 +832,7 @@ pub fn parse_stake_delegate_stake(
             nonce_authority: signer_info.index_of(nonce_authority_pubkey).unwrap(),
             memo,
             fee_payer: signer_info.index_of(fee_payer_pubkey).unwrap(),
+            redelegation_stake_account_pubkey,
         },
         signers: signer_info.signers,
     })
@@ -995,11 +1062,13 @@ pub fn parse_stake_deactivate_stake(
     let stake_account_pubkey =
         pubkey_of_signer(matches, "stake_account_pubkey", wallet_manager)?.unwrap();
     let sign_only = matches.is_present(SIGN_ONLY_ARG.name);
+    let deactivate_delinquent = matches.is_present("delinquent");
     let dump_transaction_message = matches.is_present(DUMP_TRANSACTION_MESSAGE.name);
     let blockhash_query = BlockhashQuery::new_from_matches(matches);
     let nonce_account = pubkey_of(matches, NONCE_ARG.name);
     let memo = matches.value_of(MEMO_ARG.name).map(String::from);
     let seed = value_t!(matches, "seed", String).ok();
+
     let (stake_authority, stake_authority_pubkey) =
         signer_of(matches, STAKE_AUTHORITY_ARG.name, wallet_manager)?;
     let (nonce_authority, nonce_authority_pubkey) =
@@ -1018,6 +1087,7 @@ pub fn parse_stake_deactivate_stake(
             stake_account_pubkey,
             stake_authority: signer_info.index_of(stake_authority_pubkey).unwrap(),
             sign_only,
+            deactivate_delinquent,
             dump_transaction_message,
             blockhash_query,
             nonce_account,
@@ -1184,6 +1254,16 @@ pub fn parse_show_stake_history(matches: &ArgMatches<'_>) -> Result<CliCommandIn
     })
 }
 
+pub fn parse_stake_minimum_delegation(
+    matches: &ArgMatches<'_>,
+) -> Result<CliCommandInfo, CliError> {
+    let use_lamports_unit = matches.is_present("lamports");
+    Ok(CliCommandInfo {
+        command: CliCommand::StakeMinimumDelegation { use_lamports_unit },
+        signers: vec![],
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn process_create_stake_account(
     rpc_client: &RpcClient,
@@ -1299,7 +1379,7 @@ pub fn process_create_stake_account(
         }
 
         let minimum_balance =
-            rpc_client.get_minimum_balance_for_rent_exemption(std::mem::size_of::<StakeState>())?;
+            rpc_client.get_minimum_balance_for_rent_exemption(StakeState::size_of())?;
 
         if lamports < minimum_balance {
             return Err(CliError::BadParameter(format!(
@@ -1383,11 +1463,12 @@ pub fn process_stake_authorize(
             };
             if let Some(authorized) = authorized {
                 match authorization_type {
-                    StakeAuthorize::Staker => {
-                        check_current_authority(&authorized.staker, &authority.pubkey())?;
-                    }
+                    StakeAuthorize::Staker => check_current_authority(
+                        &[authorized.withdrawer, authorized.staker],
+                        &authority.pubkey(),
+                    )?,
                     StakeAuthorize::Withdrawer => {
-                        check_current_authority(&authorized.withdrawer, &authority.pubkey())?;
+                        check_current_authority(&[authorized.withdrawer], &authority.pubkey())?;
                     }
                 }
             } else {
@@ -1476,6 +1557,7 @@ pub fn process_deactivate_stake_account(
     stake_account_pubkey: &Pubkey,
     stake_authority: SignerIndex,
     sign_only: bool,
+    deactivate_delinquent: bool,
     dump_transaction_message: bool,
     blockhash_query: &BlockhashQuery,
     nonce_account: Option<Pubkey>,
@@ -1485,7 +1567,6 @@ pub fn process_deactivate_stake_account(
     fee_payer: SignerIndex,
 ) -> ProcessResult {
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
-    let stake_authority = config.signers[stake_authority];
 
     let stake_account_address = if let Some(seed) = seed {
         Pubkey::create_with_seed(stake_account_pubkey, seed, &stake::program::id())?
@@ -1493,11 +1574,77 @@ pub fn process_deactivate_stake_account(
         *stake_account_pubkey
     };
 
-    let ixs = vec![stake_instruction::deactivate_stake(
-        &stake_account_address,
-        &stake_authority.pubkey(),
-    )]
+    let ixs = vec![if deactivate_delinquent {
+        let stake_account = rpc_client.get_account(&stake_account_address)?;
+        if stake_account.owner != stake::program::id() {
+            return Err(CliError::BadParameter(format!(
+                "{} is not a stake account",
+                stake_account_address,
+            ))
+            .into());
+        }
+
+        let vote_account_address = match stake_account.state() {
+            Ok(stake_state) => match stake_state {
+                StakeState::Stake(_, stake) => stake.delegation.voter_pubkey,
+                _ => {
+                    return Err(CliError::BadParameter(format!(
+                        "{} is not a delegated stake account",
+                        stake_account_address,
+                    ))
+                    .into())
+                }
+            },
+            Err(err) => {
+                return Err(CliError::RpcRequestError(format!(
+                    "Account data could not be deserialized to stake state: {}",
+                    err
+                ))
+                .into())
+            }
+        };
+
+        let current_epoch = rpc_client.get_epoch_info()?.epoch;
+
+        let (_, vote_state) = crate::vote::get_vote_account(
+            rpc_client,
+            &vote_account_address,
+            rpc_client.commitment(),
+        )?;
+        if !eligible_for_deactivate_delinquent(&vote_state.epoch_credits, current_epoch) {
+            return Err(CliError::BadParameter(format!(
+                "Stake has not been delinquent for {} epochs",
+                stake::MINIMUM_DELINQUENT_EPOCHS_FOR_DEACTIVATION,
+            ))
+            .into());
+        }
+
+        // Search for a reference vote account
+        let reference_vote_account_address = rpc_client
+            .get_vote_accounts()?
+            .current
+            .into_iter()
+            .find(|vote_account_info| {
+                acceptable_reference_epoch_credits(&vote_account_info.epoch_credits, current_epoch)
+            });
+        let reference_vote_account_address = reference_vote_account_address
+            .ok_or_else(|| {
+                CliError::RpcRequestError("Unable to find a reference vote account".into())
+            })?
+            .vote_pubkey
+            .parse()?;
+
+        stake_instruction::deactivate_delinquent_stake(
+            &stake_account_address,
+            &vote_account_address,
+            &reference_vote_account_address,
+        )
+    } else {
+        let stake_authority = config.signers[stake_authority];
+        stake_instruction::deactivate_stake(&stake_account_address, &stake_authority.pubkey())
+    }]
     .with_memo(memo);
+
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
@@ -1636,7 +1783,7 @@ pub fn process_withdraw_stake(
             config.commitment,
         )?;
         let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
-        log_instruction_custom_error::<SystemError>(result, config)
+        log_instruction_custom_error::<StakeError>(result, config)
     }
 }
 
@@ -1706,7 +1853,7 @@ pub fn process_split_stake(
         }
 
         let minimum_balance =
-            rpc_client.get_minimum_balance_for_rent_exemption(std::mem::size_of::<StakeState>())?;
+            rpc_client.get_minimum_balance_for_rent_exemption(StakeState::size_of())?;
 
         if lamports < minimum_balance {
             return Err(CliError::BadParameter(format!(
@@ -1929,7 +2076,7 @@ pub fn process_stake_set_lockup(
         };
         if let Some(lockup) = lockup {
             if lockup.custodian != Pubkey::default() {
-                check_current_authority(&lockup.custodian, &custodian.pubkey())?;
+                check_current_authority(&[lockup.custodian], &custodian.pubkey())?;
             }
         } else {
             return Err(CliError::RpcRequestError(format!(
@@ -2113,13 +2260,13 @@ fn get_stake_account_state(
 }
 
 pub(crate) fn check_current_authority(
-    account_current_authority: &Pubkey,
+    permitted_authorities: &[Pubkey],
     provided_current_authority: &Pubkey,
 ) -> Result<(), CliError> {
-    if account_current_authority != provided_current_authority {
+    if !permitted_authorities.contains(provided_current_authority) {
         Err(CliError::RpcRequestError(format!(
-            "Invalid current authority provided: {:?}, expected {:?}",
-            provided_current_authority, account_current_authority
+            "Invalid authority provided: {:?}, expected {:?}",
+            provided_current_authority, permitted_authorities
         )))
     } else {
         Ok(())
@@ -2315,11 +2462,28 @@ pub fn process_delegate_stake(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
+    redelegation_stake_account_pubkey: Option<&Pubkey>,
 ) -> ProcessResult {
     check_unique_pubkeys(
         (&config.signers[0].pubkey(), "cli keypair".to_string()),
         (stake_account_pubkey, "stake_account_pubkey".to_string()),
     )?;
+    if let Some(redelegation_stake_account_pubkey) = &redelegation_stake_account_pubkey {
+        check_unique_pubkeys(
+            (stake_account_pubkey, "stake_account_pubkey".to_string()),
+            (
+                redelegation_stake_account_pubkey,
+                "redelegation_stake_account".to_string(),
+            ),
+        )?;
+        check_unique_pubkeys(
+            (&config.signers[0].pubkey(), "cli keypair".to_string()),
+            (
+                redelegation_stake_account_pubkey,
+                "redelegation_stake_account".to_string(),
+            ),
+        )?;
+    }
     let stake_authority = config.signers[stake_authority];
 
     if !sign_only {
@@ -2372,12 +2536,22 @@ pub fn process_delegate_stake(
 
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
 
-    let ixs = vec![stake_instruction::delegate_stake(
-        stake_account_pubkey,
-        &stake_authority.pubkey(),
-        vote_account_pubkey,
-    )]
+    let ixs = if let Some(redelegation_stake_account_pubkey) = &redelegation_stake_account_pubkey {
+        stake_instruction::redelegate(
+            stake_account_pubkey,
+            &stake_authority.pubkey(),
+            vote_account_pubkey,
+            redelegation_stake_account_pubkey,
+        )
+    } else {
+        vec![stake_instruction::delegate_stake(
+            stake_account_pubkey,
+            &stake_authority.pubkey(),
+            vote_account_pubkey,
+        )]
+    }
     .with_memo(memo);
+
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
@@ -2421,6 +2595,28 @@ pub fn process_delegate_stake(
         let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
         log_instruction_custom_error::<StakeError>(result, config)
     }
+}
+
+pub fn process_stake_minimum_delegation(
+    rpc_client: &RpcClient,
+    config: &CliConfig,
+    use_lamports_unit: bool,
+) -> ProcessResult {
+    let stake_minimum_delegation =
+        rpc_client.get_stake_minimum_delegation_with_commitment(config.commitment)?;
+
+    let stake_minimum_delegation_output = CliBalance {
+        lamports: stake_minimum_delegation,
+        config: BuildBalanceMessageConfig {
+            use_lamports_unit,
+            show_unit: true,
+            trim_trailing_zeros: true,
+        },
+    };
+
+    Ok(config
+        .output_format
+        .formatted_string(&stake_minimum_delegation_output))
 }
 
 #[cfg(test)]
@@ -3746,6 +3942,7 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 0,
+                    redelegation_stake_account_pubkey: None,
                 },
                 signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
             }
@@ -3777,6 +3974,7 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 0,
+                    redelegation_stake_account_pubkey: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -3810,6 +4008,7 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 0,
+                    redelegation_stake_account_pubkey: None,
                 },
                 signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
             }
@@ -3844,6 +4043,7 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 0,
+                    redelegation_stake_account_pubkey: None,
                 },
                 signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
             }
@@ -3873,6 +4073,7 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 0,
+                    redelegation_stake_account_pubkey: None,
                 },
                 signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
             }
@@ -3912,6 +4113,7 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 1,
+                    redelegation_stake_account_pubkey: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -3960,6 +4162,7 @@ mod tests {
                     nonce_authority: 2,
                     memo: None,
                     fee_payer: 1,
+                    redelegation_stake_account_pubkey: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -3996,10 +4199,56 @@ mod tests {
                     nonce_authority: 0,
                     memo: None,
                     fee_payer: 1,
+                    redelegation_stake_account_pubkey: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
                     read_keypair_file(&fee_payer_keypair_file).unwrap().into()
+                ],
+            }
+        );
+
+        // Test RedelegateStake Subcommand (minimal test due to the significant implementation
+        // overlap with DelegateStake)
+        let (redelegation_stake_account_keypair_file, mut redelegation_stake_account_tmp_file) =
+            make_tmp_file();
+        let redelegation_stake_account_keypair = Keypair::new();
+        write_keypair(
+            &redelegation_stake_account_keypair,
+            redelegation_stake_account_tmp_file.as_file_mut(),
+        )
+        .unwrap();
+        let redelegation_stake_account_pubkey = redelegation_stake_account_keypair.pubkey();
+
+        let test_redelegate_stake = test_commands.clone().get_matches_from(vec![
+            "test",
+            "redelegate-stake",
+            &stake_account_string,
+            &vote_account_string,
+            &redelegation_stake_account_keypair_file,
+        ]);
+        assert_eq!(
+            parse_command(&test_redelegate_stake, &default_signer, &mut None).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::DelegateStake {
+                    stake_account_pubkey,
+                    vote_account_pubkey,
+                    stake_authority: 0,
+                    force: false,
+                    sign_only: false,
+                    dump_transaction_message: false,
+                    blockhash_query: BlockhashQuery::default(),
+                    nonce_account: None,
+                    nonce_authority: 0,
+                    memo: None,
+                    fee_payer: 0,
+                    redelegation_stake_account_pubkey: Some(redelegation_stake_account_pubkey),
+                },
+                signers: vec![
+                    read_keypair_file(&default_keypair_file).unwrap().into(),
+                    read_keypair_file(&redelegation_stake_account_keypair_file)
+                        .unwrap()
+                        .into()
                 ],
             }
         );
@@ -4173,6 +4422,34 @@ mod tests {
                     stake_account_pubkey,
                     stake_authority: 0,
                     sign_only: false,
+                    deactivate_delinquent: false,
+                    dump_transaction_message: false,
+                    blockhash_query: BlockhashQuery::default(),
+                    nonce_account: None,
+                    nonce_authority: 0,
+                    memo: None,
+                    seed: None,
+                    fee_payer: 0,
+                },
+                signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
+            }
+        );
+
+        // Test DeactivateStake Subcommand with delinquent flag
+        let test_deactivate_stake = test_commands.clone().get_matches_from(vec![
+            "test",
+            "deactivate-stake",
+            &stake_account_string,
+            "--delinquent",
+        ]);
+        assert_eq!(
+            parse_command(&test_deactivate_stake, &default_signer, &mut None).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::DeactivateStake {
+                    stake_account_pubkey,
+                    stake_authority: 0,
+                    sign_only: false,
+                    deactivate_delinquent: true,
                     dump_transaction_message: false,
                     blockhash_query: BlockhashQuery::default(),
                     nonce_account: None,
@@ -4200,6 +4477,7 @@ mod tests {
                     stake_account_pubkey,
                     stake_authority: 1,
                     sign_only: false,
+                    deactivate_delinquent: false,
                     dump_transaction_message: false,
                     blockhash_query: BlockhashQuery::default(),
                     nonce_account: None,
@@ -4234,6 +4512,7 @@ mod tests {
                     stake_account_pubkey,
                     stake_authority: 0,
                     sign_only: false,
+                    deactivate_delinquent: false,
                     dump_transaction_message: false,
                     blockhash_query: BlockhashQuery::FeeCalculator(
                         blockhash_query::Source::Cluster,
@@ -4264,6 +4543,7 @@ mod tests {
                     stake_account_pubkey,
                     stake_authority: 0,
                     sign_only: true,
+                    deactivate_delinquent: false,
                     dump_transaction_message: false,
                     blockhash_query: BlockhashQuery::None(blockhash),
                     nonce_account: None,
@@ -4298,6 +4578,7 @@ mod tests {
                     stake_account_pubkey,
                     stake_authority: 0,
                     sign_only: false,
+                    deactivate_delinquent: false,
                     dump_transaction_message: false,
                     blockhash_query: BlockhashQuery::FeeCalculator(
                         blockhash_query::Source::Cluster,
@@ -4344,6 +4625,7 @@ mod tests {
                     stake_account_pubkey,
                     stake_authority: 0,
                     sign_only: false,
+                    deactivate_delinquent: false,
                     dump_transaction_message: false,
                     blockhash_query: BlockhashQuery::FeeCalculator(
                         blockhash_query::Source::NonceAccount(nonce_account),
@@ -4378,6 +4660,7 @@ mod tests {
                     stake_account_pubkey,
                     stake_authority: 0,
                     sign_only: false,
+                    deactivate_delinquent: false,
                     dump_transaction_message: false,
                     blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
                     nonce_account: None,

@@ -52,7 +52,7 @@ use {
     },
 };
 
-const CRDS_SHARDS_BITS: u32 = 8;
+const CRDS_SHARDS_BITS: u32 = 12;
 // Number of vote slots to track in an lru-cache for metrics.
 const VOTE_SLOTS_METRICS_CAP: usize = 100;
 
@@ -77,7 +77,7 @@ pub struct Crds {
     stats: Mutex<CrdsStats>,
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum CrdsError {
     InsertFailed,
     UnknownStakes,
@@ -106,7 +106,7 @@ pub(crate) struct CrdsStats {
 }
 
 /// This structure stores some local metadata associated with the CrdsValue
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub struct VersionedCrdsValue {
     /// Ordinal index indicating insert order.
     ordinal: u64,

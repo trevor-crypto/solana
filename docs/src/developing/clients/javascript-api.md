@@ -6,6 +6,8 @@ title: Web3 JavaScript API
 
 The Solana-Web3.js library aims to provide complete coverage of Solana. The library was built on top of the [Solana JSON RPC API](https://docs.solana.com/developing/clients/jsonrpc-api).
 
+You can find the full documentation for the `@solana/web3.js` library [here](https://solana-labs.github.io/solana-web3.js/).
+
 ## Common Terminology
 
 | Term | Definition |
@@ -147,7 +149,7 @@ sendAndConfirmTransaction(
 );
 ```
 
-The above code takes in a `TransactionInstruction` using `SystemProgram`, creates a `Transaction`, and sends it over the network. You use `Connection` in order to define with Solana network you are connecting to, namely `mainnet-beta`, `testnet`, or `devnet`.
+The above code takes in a `TransactionInstruction` using `SystemProgram`, creates a `Transaction`, and sends it over the network. You use `Connection` in order to define which Solana network you are connecting to, namely `mainnet-beta`, `testnet`, or `devnet`.
 
 ### Interacting with Custom Programs
 
@@ -205,7 +207,7 @@ let allocateStruct = {
 };
 ```
 
-The above is created using using u32 and ns64 from `@solana/buffer-layout` to facilitate the payload creation. The `allocate` function takes in the parameter `space`. To interact with the function we must provide the data as a Buffer format. The `buffer-layout` library helps with allocating the buffer and encoding it correctly for Rust programs on Solana to interpret.
+The above is created using `u32` and `ns64` from `@solana/buffer-layout` to facilitate the payload creation. The `allocate` function takes in the parameter `space`. To interact with the function we must provide the data as a Buffer format. The `buffer-layout` library helps with allocating the buffer and encoding it correctly for Rust programs on Solana to interpret.
 
 Let's break down this struct.
 
@@ -236,6 +238,7 @@ pub enum SystemInstruction {
     /** 9 **/AllocateWithSeed {/**/},
     /** 10 **/AssignWithSeed {/**/},
     /** 11 **/TransferWithSeed {/**/},
+    /** 12 **/UpgradeNonceAccount,
 }
 ```
 

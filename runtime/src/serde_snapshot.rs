@@ -14,15 +14,18 @@ use {
         epoch_stakes::EpochStakes,
         hardened_unpack::UnpackedAppendVecMap,
         rent_collector::RentCollector,
+        serde_snapshot::storage::SerializableAccountStorageEntry,
+        snapshot_utils::{self, BANK_SNAPSHOT_PRE_FILENAME_EXTENSION},
         stakes::Stakes,
     },
     bincode::{self, config::Options, Error},
     log::*,
     rayon::prelude::*,
     serde::{de::DeserializeOwned, Deserialize, Serialize},
-    solana_measure::measure::Measure,
+    solana_measure::{measure, measure::Measure},
     solana_sdk::{
         clock::{Epoch, Slot, UnixTimestamp},
+        deserialize_utils::default_on_eof,
         epoch_schedule::EpochSchedule,
         fee_calculator::{FeeCalculator, FeeRateGovernor},
         genesis_config::GenesisConfig,
@@ -42,15 +45,13 @@ use {
         },
         thread::Builder,
     },
+    storage::{SerializableStorage, SerializedAppendVecId},
 };
 
-mod common;
 mod newer;
 mod storage;
 mod tests;
 mod utils;
-
-use storage::{SerializableStorage, SerializedAppendVecId};
 
 // a number of test cases in accounts_db use this
 #[cfg(test)]
@@ -63,12 +64,18 @@ pub(crate) enum SerdeStyle {
 
 const MAX_STREAM_SIZE: u64 = 32 * 1024 * 1024 * 1024;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, AbiExample)]
-struct AccountsDbFields<T>(
+#[derive(Clone, Debug, Default, Deserialize, Serialize, AbiExample, PartialEq)]
+pub struct AccountsDbFields<T>(
     HashMap<Slot, Vec<T>>,
     StoredMetaWriteVersion,
     Slot,
     BankHashInfo,
+    /// all slots that were roots within the last epoch
+    #[serde(deserialize_with = "default_on_eof")]
+    Vec<Slot>,
+    /// slots that were roots within the last epoch for which we care about the hash value
+    #[serde(deserialize_with = "default_on_eof")]
+    Vec<(Slot, Hash)>,
 );
 
 /// Helper type to wrap BufReader streams when deserializing and reconstructing from either just a
@@ -81,16 +88,16 @@ pub struct SnapshotStreams<'a, R> {
 /// Helper type to wrap AccountsDbFields when reconstructing AccountsDb from either just a full
 /// snapshot, or both a full and incremental snapshot
 #[derive(Debug)]
-struct SnapshotAccountsDbFields<T> {
+pub struct SnapshotAccountsDbFields<T> {
     full_snapshot_accounts_db_fields: AccountsDbFields<T>,
     incremental_snapshot_accounts_db_fields: Option<AccountsDbFields<T>>,
 }
 
 impl<T> SnapshotAccountsDbFields<T> {
     /// Collapse the SnapshotAccountsDbFields into a single AccountsDbFields.  If there is no
-    /// incremental snapshot, this returns the AccountsDbFields from the full snapshot.  Otherwise
-    /// this uses the version, slot, and bank hash info from the incremental snapshot, then the
-    /// combination of the storages from both the full and incremental snapshots.
+    /// incremental snapshot, this returns the AccountsDbFields from the full snapshot.
+    /// Otherwise, use the AccountsDbFields from the incremental snapshot, and a combination
+    /// of the storages from both the full and incremental snapshots.
     fn collapse_into(self) -> Result<AccountsDbFields<T>, Error> {
         match self.incremental_snapshot_accounts_db_fields {
             None => Ok(self.full_snapshot_accounts_db_fields),
@@ -99,6 +106,8 @@ impl<T> SnapshotAccountsDbFields<T> {
                 incremental_snapshot_version,
                 incremental_snapshot_slot,
                 incremental_snapshot_bank_hash_info,
+                incremental_snapshot_historical_roots,
+                incremental_snapshot_historical_roots_with_hash,
             )) => {
                 let full_snapshot_storages = self.full_snapshot_accounts_db_fields.0;
                 let full_snapshot_slot = self.full_snapshot_accounts_db_fields.2;
@@ -121,13 +130,15 @@ impl<T> SnapshotAccountsDbFields<T> {
                     incremental_snapshot_version,
                     incremental_snapshot_slot,
                     incremental_snapshot_bank_hash_info,
+                    incremental_snapshot_historical_roots,
+                    incremental_snapshot_historical_roots_with_hash,
                 ))
             }
         }
     }
 }
 
-trait TypeContext<'a> {
+trait TypeContext<'a>: PartialEq {
     type SerializableAccountStorageEntry: Serialize
         + DeserializeOwned
         + From<&'a AccountStorageEntry>
@@ -137,6 +148,14 @@ trait TypeContext<'a> {
     fn serialize_bank_and_storage<S: serde::ser::Serializer>(
         serializer: S,
         serializable_bank: &SerializableBankAndStorage<'a, Self>,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        Self: std::marker::Sized;
+
+    #[cfg(test)]
+    fn serialize_bank_and_storage_without_extra_fields<S: serde::ser::Serializer>(
+        serializer: S,
+        serializable_bank: &SerializableBankAndStorageNoExtra<'a, Self>,
     ) -> std::result::Result<S::Ok, S::Error>
     where
         Self: std::marker::Sized;
@@ -165,6 +184,18 @@ trait TypeContext<'a> {
     ) -> Result<AccountsDbFields<Self::SerializableAccountStorageEntry>, Error>
     where
         R: Read;
+
+    /// deserialize the bank from 'stream_reader'
+    /// modify the accounts_hash
+    /// reserialize the bank to 'stream_writer'
+    fn reserialize_bank_fields_with_hash<R, W>(
+        stream_reader: &mut BufReader<R>,
+        stream_writer: &mut BufWriter<W>,
+        accounts_hash: &Hash,
+    ) -> std::result::Result<(), Box<bincode::ErrorKind>>
+    where
+        R: Read,
+        W: Write;
 }
 
 fn deserialize_from<R, T>(reader: R) -> bincode::Result<T>
@@ -177,6 +208,74 @@ where
         .with_fixint_encoding()
         .allow_trailing_bytes()
         .deserialize_from::<R, T>(reader)
+}
+
+/// used by tests to compare contents of serialized bank fields
+/// serialized format is not deterministic - likely due to randomness in structs like hashmaps
+pub(crate) fn compare_two_serialized_banks(
+    path1: impl AsRef<Path>,
+    path2: impl AsRef<Path>,
+) -> std::result::Result<bool, Error> {
+    use std::fs::File;
+    let file1 = File::open(path1)?;
+    let mut stream1 = BufReader::new(file1);
+    let file2 = File::open(path2)?;
+    let mut stream2 = BufReader::new(file2);
+
+    let fields1 = newer::Context::deserialize_bank_fields(&mut stream1)?;
+    let fields2 = newer::Context::deserialize_bank_fields(&mut stream2)?;
+    Ok(fields1 == fields2)
+}
+
+pub(crate) fn fields_from_stream<R: Read>(
+    serde_style: SerdeStyle,
+    snapshot_stream: &mut BufReader<R>,
+) -> std::result::Result<
+    (
+        BankFieldsToDeserialize,
+        AccountsDbFields<SerializableAccountStorageEntry>,
+    ),
+    Error,
+> {
+    match serde_style {
+        SerdeStyle::Newer => newer::Context::deserialize_bank_fields(snapshot_stream),
+    }
+}
+
+pub(crate) fn fields_from_streams<R: Read>(
+    serde_style: SerdeStyle,
+    snapshot_streams: &mut SnapshotStreams<R>,
+) -> std::result::Result<
+    (
+        BankFieldsToDeserialize,
+        SnapshotAccountsDbFields<SerializableAccountStorageEntry>,
+    ),
+    Error,
+> {
+    let (full_snapshot_bank_fields, full_snapshot_accounts_db_fields) =
+        fields_from_stream(serde_style, snapshot_streams.full_snapshot_stream)?;
+    let incremental_fields = snapshot_streams
+        .incremental_snapshot_stream
+        .as_mut()
+        .map(|stream| fields_from_stream(serde_style, stream))
+        .transpose()?;
+
+    // Option::unzip() not stabilized yet
+    let (incremental_snapshot_bank_fields, incremental_snapshot_accounts_db_fields) =
+        if let Some((bank_fields, accounts_fields)) = incremental_fields {
+            (Some(bank_fields), Some(accounts_fields))
+        } else {
+            (None, None)
+        };
+
+    let snapshot_accounts_db_fields = SnapshotAccountsDbFields {
+        full_snapshot_accounts_db_fields,
+        incremental_snapshot_accounts_db_fields,
+    };
+    Ok((
+        incremental_snapshot_bank_fields.unwrap_or(full_snapshot_bank_fields),
+        snapshot_accounts_db_fields,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -199,51 +298,23 @@ pub(crate) fn bank_from_streams<R>(
 where
     R: Read,
 {
-    macro_rules! INTO {
-        ($style:ident) => {{
-            let (full_snapshot_bank_fields, full_snapshot_accounts_db_fields) =
-                $style::Context::deserialize_bank_fields(snapshot_streams.full_snapshot_stream)?;
-            let (incremental_snapshot_bank_fields, incremental_snapshot_accounts_db_fields) =
-                if let Some(ref mut incremental_snapshot_stream) =
-                    snapshot_streams.incremental_snapshot_stream
-                {
-                    let (bank_fields, accounts_db_fields) =
-                        $style::Context::deserialize_bank_fields(incremental_snapshot_stream)?;
-                    (Some(bank_fields), Some(accounts_db_fields))
-                } else {
-                    (None, None)
-                };
-
-            let snapshot_accounts_db_fields = SnapshotAccountsDbFields {
-                full_snapshot_accounts_db_fields,
-                incremental_snapshot_accounts_db_fields,
-            };
-            let bank = reconstruct_bank_from_fields(
-                incremental_snapshot_bank_fields.unwrap_or(full_snapshot_bank_fields),
-                snapshot_accounts_db_fields,
-                genesis_config,
-                account_paths,
-                unpacked_append_vec_map,
-                debug_keys,
-                additional_builtins,
-                account_secondary_indexes,
-                caching_enabled,
-                limit_load_slot_count_from_snapshot,
-                shrink_ratio,
-                verify_index,
-                accounts_db_config,
-                accounts_update_notifier,
-            )?;
-            Ok(bank)
-        }};
-    }
-    match serde_style {
-        SerdeStyle::Newer => INTO!(newer),
-    }
-    .map_err(|err| {
-        warn!("bankrc_from_stream error: {:?}", err);
-        err
-    })
+    let (bank_fields, accounts_db_fields) = fields_from_streams(serde_style, snapshot_streams)?;
+    reconstruct_bank_from_fields(
+        bank_fields,
+        accounts_db_fields,
+        genesis_config,
+        account_paths,
+        unpacked_append_vec_map,
+        debug_keys,
+        additional_builtins,
+        account_secondary_indexes,
+        caching_enabled,
+        limit_load_slot_count_from_snapshot,
+        shrink_ratio,
+        verify_index,
+        accounts_db_config,
+        accounts_update_notifier,
+    )
 }
 
 pub(crate) fn bank_to_stream<W>(
@@ -255,25 +326,89 @@ pub(crate) fn bank_to_stream<W>(
 where
     W: Write,
 {
-    macro_rules! INTO {
-        ($style:ident) => {
-            bincode::serialize_into(
-                stream,
-                &SerializableBankAndStorage::<$style::Context> {
-                    bank,
-                    snapshot_storages,
-                    phantom: std::marker::PhantomData::default(),
-                },
-            )
-        };
-    }
     match serde_style {
-        SerdeStyle::Newer => INTO!(newer),
+        SerdeStyle::Newer => bincode::serialize_into(
+            stream,
+            &SerializableBankAndStorage::<newer::Context> {
+                bank,
+                snapshot_storages,
+                phantom: std::marker::PhantomData::default(),
+            },
+        ),
     }
-    .map_err(|err| {
-        warn!("bankrc_to_stream error: {:?}", err);
-        err
-    })
+}
+
+#[cfg(test)]
+pub(crate) fn bank_to_stream_no_extra_fields<W>(
+    serde_style: SerdeStyle,
+    stream: &mut BufWriter<W>,
+    bank: &Bank,
+    snapshot_storages: &[SnapshotStorage],
+) -> Result<(), Error>
+where
+    W: Write,
+{
+    match serde_style {
+        SerdeStyle::Newer => bincode::serialize_into(
+            stream,
+            &SerializableBankAndStorageNoExtra::<newer::Context> {
+                bank,
+                snapshot_storages,
+                phantom: std::marker::PhantomData::default(),
+            },
+        ),
+    }
+}
+
+/// deserialize the bank from 'stream_reader'
+/// modify the accounts_hash
+/// reserialize the bank to 'stream_writer'
+fn reserialize_bank_fields_with_new_hash<W, R>(
+    stream_reader: &mut BufReader<R>,
+    stream_writer: &mut BufWriter<W>,
+    accounts_hash: &Hash,
+) -> Result<(), Error>
+where
+    W: Write,
+    R: Read,
+{
+    newer::Context::reserialize_bank_fields_with_hash(stream_reader, stream_writer, accounts_hash)
+}
+
+/// effectively updates the accounts hash in the serialized bank file on disk
+/// read serialized bank from pre file
+/// update accounts_hash
+/// write serialized bank to post file
+/// return true if pre file found
+pub fn reserialize_bank_with_new_accounts_hash(
+    bank_snapshots_dir: impl AsRef<Path>,
+    slot: Slot,
+    accounts_hash: &Hash,
+) -> bool {
+    let bank_post = snapshot_utils::get_bank_snapshots_dir(bank_snapshots_dir, slot);
+    let bank_post = bank_post.join(snapshot_utils::get_snapshot_file_name(slot));
+    let mut bank_pre = bank_post.clone();
+    bank_pre.set_extension(BANK_SNAPSHOT_PRE_FILENAME_EXTENSION);
+
+    let mut found = false;
+    {
+        let file = std::fs::File::open(&bank_pre);
+        // some tests don't create the file
+        if let Ok(file) = file {
+            found = true;
+            let file_out = std::fs::File::create(bank_post).unwrap();
+            reserialize_bank_fields_with_new_hash(
+                &mut BufReader::new(file),
+                &mut BufWriter::new(file_out),
+                accounts_hash,
+            )
+            .unwrap();
+        }
+    }
+    if found {
+        std::fs::remove_file(bank_pre).unwrap();
+    }
+    found
 }
 
 struct SerializableBankAndStorage<'a, C> {
@@ -288,6 +423,39 @@ impl<'a, C: TypeContext<'a>> Serialize for SerializableBankAndStorage<'a, C> {
         S: serde::ser::Serializer,
     {
         C::serialize_bank_and_storage(serializer, self)
+    }
+}
+
+#[cfg(test)]
+struct SerializableBankAndStorageNoExtra<'a, C> {
+    bank: &'a Bank,
+    snapshot_storages: &'a [SnapshotStorage],
+    phantom: std::marker::PhantomData<C>,
+}
+
+#[cfg(test)]
+impl<'a, C: TypeContext<'a>> Serialize for SerializableBankAndStorageNoExtra<'a, C> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        C::serialize_bank_and_storage_without_extra_fields(serializer, self)
+    }
+}
+
+#[cfg(test)]
+impl<'a, C> From<SerializableBankAndStorageNoExtra<'a, C>> for SerializableBankAndStorage<'a, C> {
+    fn from(s: SerializableBankAndStorageNoExtra<'a, C>) -> SerializableBankAndStorage<'a, C> {
+        let SerializableBankAndStorageNoExtra {
+            bank,
+            snapshot_storages,
+            phantom,
+        } = s;
+        SerializableBankAndStorage {
+            bank,
+            snapshot_storages,
+            phantom,
+        }
     }
 }
 
@@ -363,23 +531,142 @@ where
     Ok(bank)
 }
 
-fn reconstruct_single_storage<E>(
+fn reconstruct_single_storage(
     slot: &Slot,
     append_vec_path: &Path,
-    storage_entry: &E,
+    current_len: usize,
     append_vec_id: AppendVecId,
-    new_slot_storage: &mut HashMap<AppendVecId, Arc<AccountStorageEntry>>,
-) -> Result<(), Error>
+) -> io::Result<Arc<AccountStorageEntry>> {
+    let (accounts, num_accounts) = AppendVec::new_from_file(append_vec_path, current_len)?;
+    Ok(Arc::new(AccountStorageEntry::new_existing(
+        *slot,
+        append_vec_id,
+        accounts,
+        num_accounts,
+    )))
+}
+
+fn remap_append_vec_file(
+    slot: Slot,
+    old_append_vec_id: SerializedAppendVecId,
+    append_vec_path: &Path,
+    next_append_vec_id: &AtomicAppendVecId,
+    num_collisions: &AtomicUsize,
+) -> io::Result<(AppendVecId, PathBuf)> {
+    // Remap the AppendVec ID to handle any duplicate IDs that may previously existed
+    // due to full snapshots and incremental snapshots generated from different nodes
+    let (remapped_append_vec_id, remapped_append_vec_path) = loop {
+        let remapped_append_vec_id = next_append_vec_id.fetch_add(1, Ordering::AcqRel);
+        let remapped_file_name = AppendVec::file_name(slot, remapped_append_vec_id);
+        let remapped_append_vec_path = append_vec_path.parent().unwrap().join(&remapped_file_name);
+
+        // Break out of the loop in the following situations:
+        // 1. The new ID is the same as the original ID.  This means we do not need to
+        //    rename the file, since the ID is the "correct" one already.
+        // 2. There is not a file already at the new path.  This means it is safe to
+        //    rename the file to this new path.
+        //    **DEVELOPER NOTE:**  Keep this check last so that it can short-circuit if
+        //    possible.
+        if old_append_vec_id == remapped_append_vec_id as SerializedAppendVecId
+            || std::fs::metadata(&remapped_append_vec_path).is_err()
+        {
+            break (remapped_append_vec_id, remapped_append_vec_path);
+        }
+
+        // If we made it this far, a file exists at the new path.  Record the collision
+        // and try again.
+        num_collisions.fetch_add(1, Ordering::Relaxed);
+    };
+    // Only rename the file if the new ID is actually different from the original.
+    if old_append_vec_id != remapped_append_vec_id as SerializedAppendVecId {
+        std::fs::rename(append_vec_path, &remapped_append_vec_path)?;
+    }
+
+    Ok((remapped_append_vec_id, remapped_append_vec_path))
+}
+
+fn remap_and_reconstruct_single_storage(
+    slot: Slot,
+    old_append_vec_id: SerializedAppendVecId,
+    current_len: usize,
+    append_vec_path: &Path,
+    next_append_vec_id: &AtomicAppendVecId,
+    num_collisions: &AtomicUsize,
+) -> io::Result<Arc<AccountStorageEntry>> {
+    let (remapped_append_vec_id, remapped_append_vec_path) = remap_append_vec_file(
+        slot,
+        old_append_vec_id,
+        append_vec_path,
+        next_append_vec_id,
+        num_collisions,
+    )?;
+    let storage = reconstruct_single_storage(
+        &slot,
+        &remapped_append_vec_path,
+        current_len,
+        remapped_append_vec_id,
+    )?;
+    Ok(storage)
+}
+
+fn remap_and_reconstruct_slot_storage<E>(
+    slot: Slot,
+    slot_storage: &[E],
+    unpacked_append_vec_map: &UnpackedAppendVecMap,
+    next_append_vec_id: &AtomicAppendVecId,
+    num_collisions: &AtomicUsize,
+) -> Result<HashMap<AppendVecId, Arc<AccountStorageEntry>>, Error>
 where
     E: SerializableStorage,
 {
-    let (accounts, num_accounts) =
-        AppendVec::new_from_file(append_vec_path, storage_entry.current_len())?;
-    let u_storage_entry =
-        AccountStorageEntry::new_existing(*slot, append_vec_id, accounts, num_accounts);
+    slot_storage
+        .iter()
+        .map(|storage_entry| {
+            let file_name = AppendVec::file_name(slot, storage_entry.id());
+            let append_vec_path = unpacked_append_vec_map.get(&file_name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} not found in unpacked append vecs", file_name),
+                )
+            })?;
 
-    new_slot_storage.insert(append_vec_id, Arc::new(u_storage_entry));
-    Ok(())
+            let new_storage_entry = remap_and_reconstruct_single_storage(
+                slot,
+                storage_entry.id(),
+                storage_entry.current_len(),
+                append_vec_path,
+                next_append_vec_id,
+                num_collisions,
+            )?;
+            Ok((new_storage_entry.append_vec_id(), new_storage_entry))
+        })
+        .collect::<Result<HashMap<AppendVecId, _>, Error>>()
+}
+
+fn remap_and_reconstruct_storages<E>(
+    snapshot_storages: Vec<(Slot, Vec<E>)>,
+    unpacked_append_vec_map: &UnpackedAppendVecMap,
+    next_append_vec_id: &AtomicAppendVecId,
+    num_collisions: &AtomicUsize,
+) -> Result<HashMap<Slot, HashMap<AppendVecId, Arc<AccountStorageEntry>>>, Error>
+where
+    E: SerializableStorage + std::marker::Sync,
+{
+    snapshot_storages
+        .into_par_iter()
+        .map(|(slot, slot_storage)| {
+            Ok((
+                *slot,
+                remap_and_reconstruct_slot_storage(
+                    *slot,
+                    slot_storage,
+                    unpacked_append_vec_map,
+                    next_append_vec_id,
+                    num_collisions,
+                )?,
+            ))
+        })
+        .collect::<Result<HashMap<Slot, _>, Error>>()
 }
 
 /// This struct contains side-info while reconstructing the accounts DB from fields.
@@ -420,6 +707,8 @@ where
         snapshot_version,
         snapshot_slot,
         snapshot_bank_hash_info,
+        snapshot_historical_roots,
+        snapshot_historical_roots_with_hash,
     ) = snapshot_accounts_db_fields.collapse_into()?;
 
     let snapshot_storages = snapshot_storages.into_iter().collect::<Vec<_>>();
@@ -430,67 +719,21 @@ where
             .unwrap_or_else(|err| panic!("Failed to create directory {}: {}", path.display(), err));
     }
 
+    reconstruct_historical_roots(
+        &accounts_db,
+        snapshot_historical_roots,
+        snapshot_historical_roots_with_hash,
+    );
+
     // Remap the deserialized AppendVec paths to point to correct local paths
     let num_collisions = AtomicUsize::new(0);
     let next_append_vec_id = AtomicAppendVecId::new(0);
-    let mut measure_remap = Measure::start("remap");
-    let mut storage = (0..snapshot_storages.len())
-        .into_par_iter()
-        .map(|i| {
-            let (slot, slot_storage) = &snapshot_storages[i];
-            let mut new_slot_storage = HashMap::new();
-            for storage_entry in slot_storage {
-                let file_name = AppendVec::file_name(*slot, storage_entry.id());
-
-                let append_vec_path = unpacked_append_vec_map.get(&file_name).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("{} not found in unpacked append vecs", file_name),
-                    )
-                })?;
-
-                // Remap the AppendVec ID to handle any duplicate IDs that may previously existed
-                // due to full snapshots and incremental snapshots generated from different nodes
-                let (remapped_append_vec_id, remapped_append_vec_path) = loop {
-                    let remapped_append_vec_id = next_append_vec_id.fetch_add(1, Ordering::AcqRel);
-                    let remapped_file_name = AppendVec::file_name(*slot, remapped_append_vec_id);
-                    let remapped_append_vec_path =
-                        append_vec_path.parent().unwrap().join(&remapped_file_name);
-
-                    // Break out of the loop in the following situations:
-                    // 1. The new ID is the same as the original ID.  This means we do not need to
-                    //    rename the file, since the ID is the "correct" one already.
-                    // 2. There is not a file already at the new path.  This means it is safe to
-                    //    rename the file to this new path.
-                    //    **DEVELOPER NOTE:**  Keep this check last so that it can short-circuit if
-                    //    possible.
-                    if storage_entry.id() == remapped_append_vec_id as SerializedAppendVecId
-                        || std::fs::metadata(&remapped_append_vec_path).is_err()
-                    {
-                        break (remapped_append_vec_id, remapped_append_vec_path);
-                    }
-
-                    // If we made it this far, a file exists at the new path.  Record the collision
-                    // and try again.
-                    num_collisions.fetch_add(1, Ordering::Relaxed);
-                };
-                // Only rename the file if the new ID is actually different from the original.
-                if storage_entry.id() != remapped_append_vec_id as SerializedAppendVecId {
-                    std::fs::rename(append_vec_path, &remapped_append_vec_path)?;
-                }
-
-                reconstruct_single_storage(
-                    slot,
-                    &remapped_append_vec_path,
-                    storage_entry,
-                    remapped_append_vec_id,
-                    &mut new_slot_storage,
-                )?;
-            }
-            Ok((*slot, new_slot_storage))
-        })
-        .collect::<Result<HashMap<Slot, _>, Error>>()?;
-    measure_remap.stop();
+    let (mut storage, measure_remap) = measure!(remap_and_reconstruct_storages(
+        snapshot_storages,
+        &unpacked_append_vec_map,
+        &next_append_vec_id,
+        &num_collisions
+    )?);
 
     // discard any slots with no storage entries
     // this can happen if a non-root slot was serialized
@@ -530,21 +773,33 @@ where
     let mut measure_notify = Measure::start("accounts_notify");
 
     let accounts_db = Arc::new(accounts_db);
-    let accoounts_db_clone = accounts_db.clone();
+    let accounts_db_clone = accounts_db.clone();
     let handle = Builder::new()
         .name("notify_account_restore_from_snapshot".to_string())
         .spawn(move || {
-            accoounts_db_clone.notify_account_restore_from_snapshot();
+            accounts_db_clone.notify_account_restore_from_snapshot();
         })
         .unwrap();
 
-    let IndexGenerationInfo { accounts_data_len } = accounts_db.generate_index(
+    let IndexGenerationInfo {
+        accounts_data_len,
+        rent_paying_accounts_by_partition,
+    } = accounts_db.generate_index(
         limit_load_slot_count_from_snapshot,
         verify_index,
         genesis_config,
     );
+    accounts_db
+        .accounts_index
+        .rent_paying_accounts_by_partition
+        .set(rent_paying_accounts_by_partition)
+        .unwrap();
 
-    accounts_db.maybe_add_filler_accounts(&genesis_config.epoch_schedule);
+    accounts_db.maybe_add_filler_accounts(
+        &genesis_config.epoch_schedule,
+        &genesis_config.rent,
+        snapshot_slot,
+    );
 
     handle.join().unwrap();
     measure_notify.stop();
@@ -564,4 +819,26 @@ where
         Arc::try_unwrap(accounts_db).unwrap(),
         ReconstructedAccountsDbInfo { accounts_data_len },
     ))
+}
+
+/// populate 'historical_roots' from 'snapshot_historical_roots' and 'snapshot_historical_roots_with_hash'
+fn reconstruct_historical_roots(
+    accounts_db: &AccountsDb,
+    mut snapshot_historical_roots: Vec<Slot>,
+    snapshot_historical_roots_with_hash: Vec<(Slot, Hash)>,
+) {
+    // inflate 'historical_roots'
+    // inserting into 'historical_roots' needs to be in order
+    // combine the slots into 1 vec, then sort
+    // dups are ok
+    snapshot_historical_roots.extend(
+        snapshot_historical_roots_with_hash
+            .into_iter()
+            .map(|(root, _)| root),
+    );
+    snapshot_historical_roots.sort_unstable();
+    let mut roots_tracker = accounts_db.accounts_index.roots_tracker.write().unwrap();
+    snapshot_historical_roots.into_iter().for_each(|root| {
+        roots_tracker.historical_roots.insert(root);
+    });
 }

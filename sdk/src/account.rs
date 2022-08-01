@@ -4,6 +4,10 @@ use {
         lamports::LamportsError,
         pubkey::Pubkey,
     },
+    serde::{
+        ser::{Serialize, Serializer},
+        Deserialize,
+    },
     solana_program::{account_info::AccountInfo, debug_account_data::*, sysvar::Sysvar},
     std::{
         cell::{Ref, RefCell},
@@ -16,7 +20,7 @@ use {
 /// An Account with data that is stored on chain
 #[repr(C)]
 #[frozen_abi(digest = "HawRVHh7t4d3H3bitWHFt25WhhoDmbJMCfWdESQQoYEy")]
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Default, AbiExample)]
+#[derive(Deserialize, PartialEq, Eq, Clone, Default, AbiExample)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     /// lamports in the account
@@ -32,10 +36,69 @@ pub struct Account {
     pub rent_epoch: Epoch,
 }
 
+// mod because we need 'Account' below to have the name 'Account' to match expected serialization
+mod account_serialize {
+    use {
+        crate::{account::ReadableAccount, clock::Epoch, pubkey::Pubkey},
+        serde::{ser::Serializer, Serialize},
+    };
+    #[repr(C)]
+    #[frozen_abi(digest = "HawRVHh7t4d3H3bitWHFt25WhhoDmbJMCfWdESQQoYEy")]
+    #[derive(Serialize, AbiExample)]
+    #[serde(rename_all = "camelCase")]
+    struct Account<'a> {
+        lamports: u64,
+        #[serde(with = "serde_bytes")]
+        // a slice so we don't have to make a copy just to serialize this
+        data: &'a [u8],
+        // can't be &pubkey because abi example doesn't support it
+        owner: Pubkey,
+        executable: bool,
+        rent_epoch: Epoch,
+    }
+
+    /// allows us to implement serialize on AccountSharedData that is equivalent to Account::serialize without making a copy of the Vec<u8>
+    pub fn serialize_account<S>(
+        account: &(impl ReadableAccount + Serialize),
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let temp = Account {
+            lamports: account.lamports(),
+            data: account.data(),
+            owner: *account.owner(),
+            executable: account.executable(),
+            rent_epoch: account.rent_epoch(),
+        };
+        temp.serialize(serializer)
+    }
+}
+
+impl Serialize for Account {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        crate::account::account_serialize::serialize_account(self, serializer)
+    }
+}
+
+impl Serialize for AccountSharedData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        crate::account::account_serialize::serialize_account(self, serializer)
+    }
+}
+
 /// An Account with data that is stored on chain
 /// This will be the in-memory representation of the 'Account' struct data.
 /// The existing 'Account' structure cannot easily change due to downstream projects.
-#[derive(PartialEq, Eq, Clone, Default, AbiExample)]
+#[derive(PartialEq, Eq, Clone, Default, AbiExample, Deserialize)]
+#[serde(from = "Account")]
 pub struct AccountSharedData {
     /// lamports in the account
     lamports: u64,
@@ -54,10 +117,10 @@ pub struct AccountSharedData {
 /// Returns true if accounts are essentially equivalent as in all fields are equivalent.
 pub fn accounts_equal<T: ReadableAccount, U: ReadableAccount>(me: &T, other: &U) -> bool {
     me.lamports() == other.lamports()
-        && me.data() == other.data()
-        && me.owner() == other.owner()
         && me.executable() == other.executable()
         && me.rent_epoch() == other.rent_epoch()
+        && me.owner() == other.owner()
+        && me.data() == other.data()
 }
 
 impl From<AccountSharedData> for Account {
@@ -253,6 +316,10 @@ impl ReadableAccount for AccountSharedData {
     fn rent_epoch(&self) -> Epoch {
         self.rent_epoch
     }
+    fn to_account_shared_data(&self) -> AccountSharedData {
+        // avoid data copy here
+        self.clone()
+    }
 }
 
 impl ReadableAccount for Ref<'_, AccountSharedData> {
@@ -270,6 +337,16 @@ impl ReadableAccount for Ref<'_, AccountSharedData> {
     }
     fn rent_epoch(&self) -> Epoch {
         self.rent_epoch
+    }
+    fn to_account_shared_data(&self) -> AccountSharedData {
+        AccountSharedData {
+            lamports: self.lamports(),
+            // avoid data copy here
+            data: Arc::clone(&self.data),
+            owner: *self.owner(),
+            executable: self.executable(),
+            rent_epoch: self.rent_epoch(),
+        }
     }
 }
 
@@ -323,6 +400,21 @@ fn shared_new<T: WritableAccount>(lamports: u64, space: usize, owner: &Pubkey) -
         *owner,
         bool::default(),
         Epoch::default(),
+    )
+}
+
+fn shared_new_rent_epoch<T: WritableAccount>(
+    lamports: u64,
+    space: usize,
+    owner: &Pubkey,
+    rent_epoch: Epoch,
+) -> T {
+    T::create(
+        lamports,
+        vec![0u8; space],
+        *owner,
+        bool::default(),
+        rent_epoch,
     )
 }
 
@@ -434,6 +526,9 @@ impl Account {
     ) -> Result<RefCell<Self>, bincode::Error> {
         shared_new_ref_data_with_space(lamports, state, space, owner)
     }
+    pub fn new_rent_epoch(lamports: u64, space: usize, owner: &Pubkey, rent_epoch: Epoch) -> Self {
+        shared_new_rent_epoch(lamports, space, owner, rent_epoch)
+    }
     pub fn deserialize_data<T: serde::de::DeserializeOwned>(&self) -> Result<T, bincode::Error> {
         shared_deserialize_data(self)
     }
@@ -489,6 +584,9 @@ impl AccountSharedData {
         owner: &Pubkey,
     ) -> Result<RefCell<Self>, bincode::Error> {
         shared_new_ref_data_with_space(lamports, state, space, owner)
+    }
+    pub fn new_rent_epoch(lamports: u64, space: usize, owner: &Pubkey, rent_epoch: Epoch) -> Self {
+        shared_new_rent_epoch(lamports, space, owner, rent_epoch)
     }
     pub fn deserialize_data<T: serde::de::DeserializeOwned>(&self) -> Result<T, bincode::Error> {
         shared_deserialize_data(self)

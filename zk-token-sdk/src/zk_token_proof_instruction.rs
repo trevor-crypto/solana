@@ -7,7 +7,7 @@ use {
     solana_program::instruction::Instruction,
 };
 
-#[derive(Clone, Copy, Debug, FromPrimitive, ToPrimitive, PartialEq)]
+#[derive(Clone, Copy, Debug, FromPrimitive, ToPrimitive, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ProofInstruction {
     /// Verify a `CloseAccountData` struct
@@ -30,6 +30,16 @@ pub enum ProofInstruction {
     ///
     VerifyWithdraw,
 
+    /// Verify a `WithdrawWithheldTokensData` struct
+    ///
+    /// Accounts expected by this instruction:
+    ///   None
+    ///
+    /// Data expected by this instruction:
+    ///   `WithdrawWithheldTokensData`
+    ///
+    VerifyWithdrawWithheldTokens,
+
     /// Verify a `TransferData` struct
     ///
     /// Accounts expected by this instruction:
@@ -39,6 +49,16 @@ pub enum ProofInstruction {
     ///   `TransferData`
     ///
     VerifyTransfer,
+
+    /// Verify a `TransferWithFeeData` struct
+    ///
+    /// Accounts expected by this instruction:
+    ///   None
+    ///
+    /// Data expected by this instruction:
+    ///   `TransferWithFeeData`
+    ///
+    VerifyTransferWithFee,
 }
 
 impl ProofInstruction {
@@ -53,7 +73,7 @@ impl ProofInstruction {
     }
 
     pub fn decode_type(input: &[u8]) -> Option<Self> {
-        FromPrimitive::from_u8(input[0])
+        input.first().and_then(|x| FromPrimitive::from_u8(*x))
     }
 
     pub fn decode_data<T: Pod>(input: &[u8]) -> Option<&T> {
@@ -73,6 +93,14 @@ pub fn verify_withdraw(proof_data: &WithdrawData) -> Instruction {
     ProofInstruction::VerifyWithdraw.encode(proof_data)
 }
 
+pub fn verify_withdraw_withheld_tokens(proof_data: &WithdrawWithheldTokensData) -> Instruction {
+    ProofInstruction::VerifyWithdrawWithheldTokens.encode(proof_data)
+}
+
 pub fn verify_transfer(proof_data: &TransferData) -> Instruction {
     ProofInstruction::VerifyTransfer.encode(proof_data)
+}
+
+pub fn verify_transfer_with_fee(proof_data: &TransferWithFeeData) -> Instruction {
+    ProofInstruction::VerifyTransferWithFee.encode(proof_data)
 }

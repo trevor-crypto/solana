@@ -1,4 +1,4 @@
-use {super::*, std::time::Instant};
+use {super::*, solana_sdk::message::AccountKeys, std::time::Instant};
 
 #[derive(Default)]
 pub struct PurgeStats {
@@ -6,11 +6,36 @@ pub struct PurgeStats {
     write_batch: u64,
 }
 
+#[derive(Clone, Copy)]
+/// Controls how `blockstore::purge_slots` purges the data.
+pub enum PurgeType {
+    /// A slower but more accurate way to purge slots by also ensuring higher
+    /// level of consistency between data during the clean up process.
+    Exact,
+    /// A faster approximation of `Exact` where the purge process only takes
+    /// care of the primary index and does not update the associated entries.
+    PrimaryIndex,
+    /// The fastest purge mode that relies on the slot-id based TTL
+    /// compaction filter to do the cleanup.
+    CompactionFilter,
+}
+
 impl Blockstore {
-    /// Silently deletes all blockstore column families in the range \[from_slot,to_slot\]
-    /// Dangerous; Use with care:
-    /// Does not check for integrity and does not update slot metas that refer to deleted slots
-    /// Modifies multiple column families simultaneously
+    /// Performs cleanup based on the specified deletion range.  After this
+    /// function call, entries within \[`from_slot`, `to_slot`\] will become
+    /// unavailable to the reader immediately, while its disk space occupied
+    /// by the deletion entries are reclaimed later via RocksDB's background
+    /// compaction.
+    ///
+    /// Note that this function modifies multiple column families at the same
+    /// time and might break the consistency between different column families
+    /// as it does not update the associated slot-meta entries that refer to
+    /// the deleted entries.
+    ///
+    /// For slot-id based column families, the purge is done by range deletion,
+    /// while the non-slot-id based column families, `cf::TransactionStatus`,
+    /// `AddressSignature`, and `cf::TransactionStatusIndex`, are cleaned-up
+    /// based on the `purge_type` setting.
     pub fn purge_slots(&self, from_slot: Slot, to_slot: Slot, purge_type: PurgeType) {
         let mut purge_stats = PurgeStats::default();
         let purge_result =
@@ -114,7 +139,8 @@ impl Blockstore {
         self.run_purge_with_stats(from_slot, to_slot, purge_type, &mut PurgeStats::default())
     }
 
-    // Returns whether or not all columns successfully purged the slot range
+    /// A helper function to `purge_slots` that executes the ledger clean up
+    /// from `from_slot` to `to_slot`.
     pub(crate) fn run_purge_with_stats(
         &self,
         from_slot: Slot,
@@ -185,6 +211,10 @@ impl Blockstore {
             & self
                 .db
                 .delete_range_cf::<cf::BlockHeight>(&mut write_batch, from_slot, to_slot)
+                .is_ok()
+            & self
+                .db
+                .delete_range_cf::<cf::OptimisticSlots>(&mut write_batch, from_slot, to_slot)
                 .is_ok();
         let mut w_active_transaction_status_index =
             self.active_transaction_status_index.write().unwrap();
@@ -302,6 +332,10 @@ impl Blockstore {
             && self
                 .block_height_cf
                 .compact_range(from_slot, to_slot)
+                .unwrap_or(false)
+            && self
+                .optimistic_slots_cf
+                .compact_range(from_slot, to_slot)
                 .unwrap_or(false);
         compact_timer.stop();
         if !result {
@@ -314,9 +348,11 @@ impl Blockstore {
         Ok(result)
     }
 
-    /// Purges special columns (using a non-Slot primary-index) exactly, by deserializing each slot
-    /// being purged and iterating through all transactions to determine the keys of individual
-    /// records. **This method is very slow.**
+    /// Purges special columns (using a non-Slot primary-index) exactly, by
+    /// deserializing each slot being purged and iterating through all
+    /// transactions to determine the keys of individual records.
+    ///
+    /// **This method is very slow.**
     fn purge_special_columns_exact(
         &self,
         batch: &mut WriteBatch,
@@ -334,16 +370,17 @@ impl Blockstore {
                 if let Some(&signature) = transaction.signatures.get(0) {
                     batch.delete::<cf::TransactionStatus>((0, signature, slot))?;
                     batch.delete::<cf::TransactionStatus>((1, signature, slot))?;
-                    for pubkey in transaction.message.into_static_account_keys() {
-                        batch.delete::<cf::AddressSignatures>((0, pubkey, slot, signature))?;
-                        batch.delete::<cf::AddressSignatures>((1, pubkey, slot, signature))?;
-                    }
+
                     let meta = self.read_transaction_status((signature, slot))?;
-                    let loaded_addresses =
-                        meta.map(|meta| meta.loaded_addresses).unwrap_or_default();
-                    for address in loaded_addresses.into_ordered_iter() {
-                        batch.delete::<cf::AddressSignatures>((0, address, slot, signature))?;
-                        batch.delete::<cf::AddressSignatures>((1, address, slot, signature))?;
+                    let loaded_addresses = meta.map(|meta| meta.loaded_addresses);
+                    let account_keys = AccountKeys::new(
+                        transaction.message.static_account_keys(),
+                        loaded_addresses.as_ref(),
+                    );
+
+                    for pubkey in account_keys.iter() {
+                        batch.delete::<cf::AddressSignatures>((0, *pubkey, slot, signature))?;
+                        batch.delete::<cf::AddressSignatures>((1, *pubkey, slot, signature))?;
                     }
                 }
             }
@@ -359,8 +396,9 @@ impl Blockstore {
         Ok(())
     }
 
-    /// Purges special columns (using a non-Slot primary-index) by range. Purge occurs if frozen
-    /// primary index has a max-slot less than the highest slot being purged.
+    /// Purges special columns (using a non-Slot primary-index) by range. Purge
+    /// occurs if frozen primary index has a max-slot less than the highest slot
+    /// being purged.
     fn purge_special_columns_with_primary_index(
         &self,
         write_batch: &mut WriteBatch,
@@ -410,99 +448,6 @@ pub mod tests {
         },
     };
 
-    // check that all columns are either empty or start at `min_slot`
-    fn test_all_empty_or_min(blockstore: &Blockstore, min_slot: Slot) {
-        let condition_met = blockstore
-            .db
-            .iter::<cf::SlotMeta>(IteratorMode::Start)
-            .unwrap()
-            .next()
-            .map(|(slot, _)| slot >= min_slot)
-            .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::Root>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|(slot, _)| slot >= min_slot)
-                .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::ShredData>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|((slot, _), _)| slot >= min_slot)
-                .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::ShredCode>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|((slot, _), _)| slot >= min_slot)
-                .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::DeadSlots>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|(slot, _)| slot >= min_slot)
-                .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::DuplicateSlots>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|(slot, _)| slot >= min_slot)
-                .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::ErasureMeta>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|((slot, _), _)| slot >= min_slot)
-                .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::Orphans>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|(slot, _)| slot >= min_slot)
-                .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::Index>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|(slot, _)| slot >= min_slot)
-                .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::TransactionStatus>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|((primary_index, _, slot), _)| {
-                    slot >= min_slot || (primary_index == 2 && slot == 0)
-                })
-                .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::AddressSignatures>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|((primary_index, _, slot, _), _)| {
-                    slot >= min_slot || (primary_index == 2 && slot == 0)
-                })
-                .unwrap_or(true)
-            & blockstore
-                .db
-                .iter::<cf::Rewards>(IteratorMode::Start)
-                .unwrap()
-                .next()
-                .map(|(slot, _)| slot >= min_slot)
-                .unwrap_or(true);
-        assert!(condition_met);
-    }
-
     #[test]
     fn test_purge_slots() {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
@@ -527,18 +472,6 @@ pub mod tests {
             .for_each(|(_, _)| {
                 panic!();
             });
-    }
-
-    #[test]
-    fn test_purge_huge() {
-        let ledger_path = get_tmp_ledger_path_auto_delete!();
-        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
-
-        let (shreds, _) = make_many_slot_entries(0, 5000, 10);
-        blockstore.insert_shreds(shreds, None, false).unwrap();
-
-        blockstore.purge_and_compact_slots(0, 4999);
-        test_all_empty_or_min(&blockstore, 5000);
     }
 
     #[test]

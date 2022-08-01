@@ -8,9 +8,12 @@ use {
     log::*,
     rand::{thread_rng, Rng},
     rayon::prelude::*,
+    solana_client::connection_cache::ConnectionCache,
     solana_core::{
         banking_stage::{BankingStage, BankingStageStats},
+        leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
         qos_service::QosService,
+        unprocessed_packet_batches::*,
     },
     solana_entry::entry::{next_hash, Entry},
     solana_gossip::cluster_info::{ClusterInfo, Node},
@@ -22,7 +25,7 @@ use {
     },
     solana_perf::{packet::to_packet_batches, test_tx::test_tx},
     solana_poh::poh_recorder::{create_test_recorder, WorkingBankEntry},
-    solana_runtime::{bank::Bank, cost_model::CostModel},
+    solana_runtime::{bank::Bank, bank_forks::BankForks, cost_model::CostModel},
     solana_sdk::{
         genesis_config::GenesisConfig,
         hash::Hash,
@@ -35,7 +38,6 @@ use {
     },
     solana_streamer::socket::SocketAddrSpace,
     std::{
-        collections::VecDeque,
         sync::{atomic::Ordering, Arc, RwLock},
         time::{Duration, Instant},
     },
@@ -70,34 +72,34 @@ fn bench_consume_buffered(bencher: &mut Bencher) {
             Blockstore::open(&ledger_path).expect("Expected to be able to open database ledger"),
         );
         let (exit, poh_recorder, poh_service, _signal_receiver) =
-            create_test_recorder(&bank, &blockstore, None);
+            create_test_recorder(&bank, &blockstore, None, None);
 
-        let recorder = poh_recorder.lock().unwrap().recorder();
+        let recorder = poh_recorder.read().unwrap().recorder();
 
         let tx = test_tx();
-        let len = 4096;
-        let chunk_size = 1024;
-        let batches = to_packet_batches(&vec![tx; len], chunk_size);
-        let mut packet_batches = VecDeque::new();
-        for batch in batches {
-            let batch_len = batch.packets.len();
-            packet_batches.push_back((batch, vec![0usize; batch_len], false));
-        }
+        let transactions = vec![tx; 4194304];
+        let batches = transactions_to_deserialized_packets(&transactions).unwrap();
+        let batches_len = batches.len();
+        let mut transaction_buffer =
+            UnprocessedPacketBatches::from_iter(batches.into_iter(), 2 * batches_len);
         let (s, _r) = unbounded();
         // This tests the performance of buffering packets.
         // If the packet buffers are copied, performance will be poor.
         bencher.iter(move || {
-            let _ignored = BankingStage::consume_buffered_packets(
+            BankingStage::consume_buffered_packets(
                 &my_pubkey,
                 std::u128::MAX,
                 &poh_recorder,
-                &mut packet_batches,
+                &mut transaction_buffer,
                 None,
                 &s,
                 None::<Box<dyn Fn()>>,
                 &BankingStageStats::default(),
                 &recorder,
                 &QosService::new(Arc::new(RwLock::new(CostModel::default())), 1),
+                &mut LeaderSlotMetricsTracker::new(0),
+                10,
+                None,
             );
         });
 
@@ -169,7 +171,8 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
     let mut bank = Bank::new_for_benches(&genesis_config);
     // Allow arbitrary transaction processing time for the purposes of this bench
     bank.ns_per_slot = u128::MAX;
-    let bank = Arc::new(bank);
+    let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+    let bank = bank_forks.read().unwrap().get(0).unwrap();
 
     // set cost tracker limits to MAX so it will not filter out TXs
     bank.write_cost_tracker()
@@ -213,7 +216,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
             Blockstore::open(&ledger_path).expect("Expected to be able to open database ledger"),
         );
         let (exit, poh_recorder, poh_service, signal_receiver) =
-            create_test_recorder(&bank, &blockstore, None);
+            create_test_recorder(&bank, &blockstore, None, None);
         let cluster_info = ClusterInfo::new(
             Node::new_localhost().info,
             Arc::new(Keypair::new()),
@@ -230,8 +233,11 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
             None,
             s,
             Arc::new(RwLock::new(CostModel::default())),
+            None,
+            Arc::new(ConnectionCache::default()),
+            bank_forks,
         );
-        poh_recorder.lock().unwrap().set_bank(&bank);
+        poh_recorder.write().unwrap().set_bank(&bank, false);
 
         let chunk_len = verified.len() / CHUNKS;
         let mut start = 0;
@@ -254,9 +260,9 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
                     v.len(),
                 );
                 for xv in v {
-                    sent += xv.packets.len();
+                    sent += xv.len();
                 }
-                verified_sender.send(v.to_vec()).unwrap();
+                verified_sender.send((v.to_vec(), None)).unwrap();
             }
             check_txs(&signal_receiver2, txes / CHUNKS);
 

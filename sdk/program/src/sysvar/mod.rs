@@ -1,5 +1,9 @@
-//! named accounts for synthesized data accounts for bank state, etc.
+//! Access to special accounts with dynamically-updated data.
 //!
+//! For more details see the Solana [documentation on sysvars][sysvardoc].
+//!
+//! [sysvardoc]: https://docs.solana.com/developing/runtime-facilities/sysvars
+
 use {
     crate::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey},
     lazy_static::lazy_static,
@@ -37,6 +41,7 @@ pub fn is_sysvar_id(id: &Pubkey) -> bool {
     ALL_IDS.iter().any(|key| key == id)
 }
 
+/// Declares an ID that implements [`SysvarId`].
 #[macro_export]
 macro_rules! declare_sysvar_id(
     ($name:expr, $type:ty) => (
@@ -60,6 +65,7 @@ macro_rules! declare_sysvar_id(
     )
 );
 
+/// Same as [`declare_sysvar_id`] except that it reports that this ID has been deprecated.
 #[macro_export]
 macro_rules! declare_deprecated_sysvar_id(
     ($name:expr, $type:ty) => (
@@ -101,6 +107,13 @@ pub trait Sysvar:
     fn size_of() -> usize {
         bincode::serialized_size(&Self::default()).unwrap() as usize
     }
+
+    /// Deserializes a sysvar from its `AccountInfo`.
+    ///
+    /// # Errors
+    ///
+    /// If `account_info` does not have the same ID as the sysvar
+    /// this function returns [`ProgramError::InvalidArgument`].
     fn from_account_info(account_info: &AccountInfo) -> Result<Self, ProgramError> {
         if !Self::check_id(account_info.unsigned_key()) {
             return Err(ProgramError::InvalidArgument);
@@ -115,6 +128,7 @@ pub trait Sysvar:
     }
 }
 
+/// Implements the [`Sysvar::get`] method for both BPF and host targets.
 #[macro_export]
 macro_rules! impl_sysvar_get {
     ($syscall_name:ident) => {
@@ -122,18 +136,14 @@ macro_rules! impl_sysvar_get {
             let mut var = Self::default();
             let var_addr = &mut var as *mut _ as *mut u8;
 
-            #[cfg(target_arch = "bpf")]
-            let result = unsafe {
-                extern "C" {
-                    fn $syscall_name(var_addr: *mut u8) -> u64;
-                }
-                $syscall_name(var_addr)
-            };
-            #[cfg(not(target_arch = "bpf"))]
-            let result = crate::program_stubs::$syscall_name(var_addr);
+            #[cfg(target_os = "solana")]
+            let result = unsafe { $crate::syscalls::$syscall_name(var_addr) };
+
+            #[cfg(not(target_os = "solana"))]
+            let result = $crate::program_stubs::$syscall_name(var_addr);
 
             match result {
-                crate::entrypoint::SUCCESS => Ok(var),
+                $crate::entrypoint::SUCCESS => Ok(var),
                 e => Err(e.into()),
             }
         }
@@ -149,7 +159,7 @@ mod tests {
     };
 
     #[repr(C)]
-    #[derive(Serialize, Deserialize, Debug, Default, PartialEq)]
+    #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
     struct TestSysvar {
         something: Pubkey,
     }

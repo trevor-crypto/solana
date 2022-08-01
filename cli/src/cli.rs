@@ -7,7 +7,8 @@ use {
     log::*,
     num_traits::FromPrimitive,
     serde_json::{self, Value},
-    solana_clap_utils::{self, input_parsers::*, input_validators::*, keypair::*},
+    solana_clap_utils::{self, input_parsers::*, keypair::*},
+    solana_cli_config::ConfigInput,
     solana_cli_output::{
         display::println_name_value, CliSignature, CliValidatorsSortOrder, OutputFormat,
     },
@@ -30,7 +31,7 @@ use {
         pubkey::Pubkey,
         signature::{Signature, Signer, SignerError},
         stake::{instruction::LockupArgs, state::Lockup},
-        transaction::{Transaction, TransactionError},
+        transaction::{TransactionError, VersionedTransaction},
     },
     solana_vote_program::vote_state::VoteAuthorize,
     std::{collections::HashMap, error, io::stdout, str::FromStr, sync::Arc, time::Duration},
@@ -88,6 +89,7 @@ pub enum CliCommand {
         timeout: Duration,
         blockhash: Option<Hash>,
         print_timestamp: bool,
+        compute_unit_price: Option<u64>,
     },
     Rent {
         data_length: usize,
@@ -101,6 +103,7 @@ pub enum CliCommand {
     ShowStakes {
         use_lamports_unit: bool,
         vote_account_pubkeys: Option<Vec<Pubkey>>,
+        withdraw_authority: Option<Pubkey>,
     },
     ShowValidators {
         use_lamports_unit: bool,
@@ -155,12 +158,17 @@ pub enum CliCommand {
         destination_account_pubkey: Pubkey,
         lamports: u64,
     },
+    UpgradeNonceAccount {
+        nonce_account: Pubkey,
+        memo: Option<String>,
+    },
     // Program Deployment
     Deploy {
         program_location: String,
         address: Option<SignerIndex>,
         use_deprecated_loader: bool,
         allow_excessive_balance: bool,
+        skip_fee_check: bool,
     },
     Program(ProgramCliCommand),
     // Stake Commands
@@ -185,6 +193,7 @@ pub enum CliCommand {
         stake_account_pubkey: Pubkey,
         stake_authority: SignerIndex,
         sign_only: bool,
+        deactivate_delinquent: bool,
         dump_transaction_message: bool,
         blockhash_query: BlockhashQuery,
         nonce_account: Option<Pubkey>,
@@ -205,6 +214,7 @@ pub enum CliCommand {
         nonce_authority: SignerIndex,
         memo: Option<String>,
         fee_payer: SignerIndex,
+        redelegation_stake_account_pubkey: Option<Pubkey>,
     },
     SplitStake {
         stake_account_pubkey: Pubkey,
@@ -384,7 +394,7 @@ pub enum CliCommand {
         seed: String,
         program_id: Pubkey,
     },
-    DecodeTransaction(Transaction),
+    DecodeTransaction(VersionedTransaction),
     ResolveSigner(Option<String>),
     ShowAccount {
         pubkey: Pubkey,
@@ -406,6 +416,9 @@ pub enum CliCommand {
         fee_payer: SignerIndex,
         derived_address_seed: Option<String>,
         derived_address_program_id: Option<Pubkey>,
+    },
+    StakeMinimumDelegation {
+        use_lamports_unit: bool,
     },
 }
 
@@ -454,129 +467,23 @@ impl From<nonce_utils::Error> for CliError {
     }
 }
 
-pub enum SettingType {
-    Explicit,
-    Computed,
-    SystemDefault,
-}
-
 pub struct CliConfig<'a> {
     pub command: CliCommand,
     pub json_rpc_url: String,
     pub websocket_url: String,
-    pub signers: Vec<&'a dyn Signer>,
     pub keypair_path: String,
+    pub commitment: CommitmentConfig,
+    pub signers: Vec<&'a dyn Signer>,
     pub rpc_client: Option<Arc<RpcClient>>,
     pub rpc_timeout: Duration,
     pub verbose: bool,
     pub output_format: OutputFormat,
-    pub commitment: CommitmentConfig,
     pub send_transaction_config: RpcSendTransactionConfig,
     pub confirm_transaction_initial_timeout: Duration,
     pub address_labels: HashMap<String, String>,
 }
 
 impl CliConfig<'_> {
-    fn default_keypair_path() -> String {
-        solana_cli_config::Config::default().keypair_path
-    }
-
-    fn default_json_rpc_url() -> String {
-        solana_cli_config::Config::default().json_rpc_url
-    }
-
-    fn default_websocket_url() -> String {
-        solana_cli_config::Config::default().websocket_url
-    }
-
-    fn default_commitment() -> CommitmentConfig {
-        CommitmentConfig::confirmed()
-    }
-
-    fn first_nonempty_setting(
-        settings: std::vec::Vec<(SettingType, String)>,
-    ) -> (SettingType, String) {
-        settings
-            .into_iter()
-            .find(|(_, value)| !value.is_empty())
-            .expect("no nonempty setting")
-    }
-
-    fn first_setting_is_some<T>(
-        settings: std::vec::Vec<(SettingType, Option<T>)>,
-    ) -> (SettingType, T) {
-        let (setting_type, setting_option) = settings
-            .into_iter()
-            .find(|(_, value)| value.is_some())
-            .expect("all settings none");
-        (setting_type, setting_option.unwrap())
-    }
-
-    pub fn compute_websocket_url_setting(
-        websocket_cmd_url: &str,
-        websocket_cfg_url: &str,
-        json_rpc_cmd_url: &str,
-        json_rpc_cfg_url: &str,
-    ) -> (SettingType, String) {
-        Self::first_nonempty_setting(vec![
-            (SettingType::Explicit, websocket_cmd_url.to_string()),
-            (SettingType::Explicit, websocket_cfg_url.to_string()),
-            (
-                SettingType::Computed,
-                solana_cli_config::Config::compute_websocket_url(&normalize_to_url_if_moniker(
-                    json_rpc_cmd_url,
-                )),
-            ),
-            (
-                SettingType::Computed,
-                solana_cli_config::Config::compute_websocket_url(&normalize_to_url_if_moniker(
-                    json_rpc_cfg_url,
-                )),
-            ),
-            (SettingType::SystemDefault, Self::default_websocket_url()),
-        ])
-    }
-
-    pub fn compute_json_rpc_url_setting(
-        json_rpc_cmd_url: &str,
-        json_rpc_cfg_url: &str,
-    ) -> (SettingType, String) {
-        let (setting_type, url_or_moniker) = Self::first_nonempty_setting(vec![
-            (SettingType::Explicit, json_rpc_cmd_url.to_string()),
-            (SettingType::Explicit, json_rpc_cfg_url.to_string()),
-            (SettingType::SystemDefault, Self::default_json_rpc_url()),
-        ]);
-        (setting_type, normalize_to_url_if_moniker(&url_or_moniker))
-    }
-
-    pub fn compute_keypair_path_setting(
-        keypair_cmd_path: &str,
-        keypair_cfg_path: &str,
-    ) -> (SettingType, String) {
-        Self::first_nonempty_setting(vec![
-            (SettingType::Explicit, keypair_cmd_path.to_string()),
-            (SettingType::Explicit, keypair_cfg_path.to_string()),
-            (SettingType::SystemDefault, Self::default_keypair_path()),
-        ])
-    }
-
-    pub fn compute_commitment_config(
-        commitment_cmd: &str,
-        commitment_cfg: &str,
-    ) -> (SettingType, CommitmentConfig) {
-        Self::first_setting_is_some(vec![
-            (
-                SettingType::Explicit,
-                CommitmentConfig::from_str(commitment_cmd).ok(),
-            ),
-            (
-                SettingType::Explicit,
-                CommitmentConfig::from_str(commitment_cfg).ok(),
-            ),
-            (SettingType::SystemDefault, Some(Self::default_commitment())),
-        ])
-    }
-
     pub(crate) fn pubkey(&self) -> Result<Pubkey, SignerError> {
         if !self.signers.is_empty() {
             self.signers[0].try_pubkey()
@@ -607,15 +514,15 @@ impl Default for CliConfig<'_> {
                 pubkey: Some(Pubkey::default()),
                 use_lamports_unit: false,
             },
-            json_rpc_url: Self::default_json_rpc_url(),
-            websocket_url: Self::default_websocket_url(),
+            json_rpc_url: ConfigInput::default().json_rpc_url,
+            websocket_url: ConfigInput::default().websocket_url,
+            keypair_path: ConfigInput::default().keypair_path,
+            commitment: ConfigInput::default().commitment,
             signers: Vec::new(),
-            keypair_path: Self::default_keypair_path(),
             rpc_client: None,
             rpc_timeout: Duration::from_secs(u64::from_str(DEFAULT_RPC_TIMEOUT_SECONDS).unwrap()),
             verbose: false,
             output_format: OutputFormat::Display,
-            commitment: CommitmentConfig::confirmed(),
             send_transaction_config: RpcSendTransactionConfig::default(),
             confirm_transaction_initial_timeout: Duration::from_secs(
                 u64::from_str(DEFAULT_CONFIRM_TX_TIMEOUT_SECONDS).unwrap(),
@@ -735,6 +642,7 @@ pub fn parse_command(
         ("withdraw-from-nonce-account", Some(matches)) => {
             parse_withdraw_from_nonce_account(matches, default_signer, wallet_manager)
         }
+        ("upgrade-nonce-account", Some(matches)) => parse_upgrade_nonce_account(matches),
         // Program Deployment
         ("deploy", Some(matches)) => {
             let (address_signer, _address) = signer_of(matches, "address_signer", wallet_manager)?;
@@ -743,6 +651,7 @@ pub fn parse_command(
                 signers.push(signer);
                 1
             });
+            let skip_fee_check = matches.is_present("skip_fee_check");
 
             Ok(CliCommandInfo {
                 command: CliCommand::Deploy {
@@ -750,6 +659,7 @@ pub fn parse_command(
                     address,
                     use_deprecated_loader: matches.is_present("use_deprecated_loader"),
                     allow_excessive_balance: matches.is_present("allow_excessive_balance"),
+                    skip_fee_check,
                 },
                 signers,
             })
@@ -772,6 +682,9 @@ pub fn parse_command(
             parse_create_stake_account(matches, default_signer, wallet_manager, CHECKED)
         }
         ("delegate-stake", Some(matches)) => {
+            parse_stake_delegate_stake(matches, default_signer, wallet_manager)
+        }
+        ("redelegate-stake", Some(matches)) => {
             parse_stake_delegate_stake(matches, default_signer, wallet_manager)
         }
         ("withdraw-stake", Some(matches)) => {
@@ -800,6 +713,7 @@ pub fn parse_command(
         }
         ("stake-account", Some(matches)) => parse_show_stake_account(matches, wallet_manager),
         ("stake-history", Some(matches)) => parse_show_stake_history(matches),
+        ("stake-minimum-delegation", Some(matches)) => parse_stake_minimum_delegation(matches),
         // Validator Info Commands
         ("validator-info", Some(matches)) => match matches.subcommand() {
             ("publish", Some(matches)) => {
@@ -977,6 +891,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             timeout,
             blockhash,
             print_timestamp,
+            compute_unit_price,
         } => process_ping(
             &rpc_client,
             config,
@@ -985,6 +900,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             timeout,
             blockhash,
             *print_timestamp,
+            compute_unit_price,
         ),
         CliCommand::Rent {
             data_length,
@@ -997,11 +913,13 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
         CliCommand::ShowStakes {
             use_lamports_unit,
             vote_account_pubkeys,
+            withdraw_authority,
         } => process_show_stakes(
             &rpc_client,
             config,
             *use_lamports_unit,
             vote_account_pubkeys.as_deref(),
+            withdraw_authority.as_ref(),
         ),
         CliCommand::WaitForMaxStake { max_stake_percent } => {
             process_wait_for_max_stake(&rpc_client, config, *max_stake_percent)
@@ -1117,6 +1035,11 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             destination_account_pubkey,
             *lamports,
         ),
+        // Upgrade nonce account out of blockhash domain.
+        CliCommand::UpgradeNonceAccount {
+            nonce_account,
+            memo,
+        } => process_upgrade_nonce_account(&rpc_client, config, *nonce_account, memo.as_ref()),
 
         // Program Deployment
 
@@ -1126,6 +1049,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             address,
             use_deprecated_loader,
             allow_excessive_balance,
+            skip_fee_check,
         } => process_deploy(
             rpc_client,
             config,
@@ -1133,6 +1057,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *address,
             *use_deprecated_loader,
             *allow_excessive_balance,
+            *skip_fee_check,
         ),
         CliCommand::Program(program_subcommand) => {
             process_program_subcommand(rpc_client, config, program_subcommand)
@@ -1180,6 +1105,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             stake_account_pubkey,
             stake_authority,
             sign_only,
+            deactivate_delinquent,
             dump_transaction_message,
             blockhash_query,
             nonce_account,
@@ -1193,6 +1119,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             stake_account_pubkey,
             *stake_authority,
             *sign_only,
+            *deactivate_delinquent,
             *dump_transaction_message,
             blockhash_query,
             *nonce_account,
@@ -1213,6 +1140,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             nonce_authority,
             memo,
             fee_payer,
+            redelegation_stake_account_pubkey,
         } => process_delegate_stake(
             &rpc_client,
             config,
@@ -1227,6 +1155,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *fee_payer,
+            redelegation_stake_account_pubkey.as_ref(),
         ),
         CliCommand::SplitStake {
             stake_account_pubkey,
@@ -1382,6 +1311,9 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             seed.as_ref(),
             *fee_payer,
         ),
+        CliCommand::StakeMinimumDelegation { use_lamports_unit } => {
+            process_stake_minimum_delegation(&rpc_client, config, *use_lamports_unit)
+        }
 
         // Validator Info Commands
 
@@ -1706,7 +1638,7 @@ mod tests {
         serde_json::{json, Value},
         solana_client::{
             blockhash_query,
-            mock_sender::SIGNATURE,
+            mock_sender_for_cli::SIGNATURE,
             rpc_request::RpcRequest,
             rpc_response::{Response, RpcResponseContext},
         },
@@ -1964,6 +1896,7 @@ mod tests {
                     address: None,
                     use_deprecated_loader: false,
                     allow_excessive_balance: false,
+                    skip_fee_check: false,
                 },
                 signers: vec![read_keypair_file(&keypair_file).unwrap().into()],
             }
@@ -1986,6 +1919,7 @@ mod tests {
                     address: Some(1),
                     use_deprecated_loader: false,
                     allow_excessive_balance: false,
+                    skip_fee_check: false,
                 },
                 signers: vec![
                     read_keypair_file(&keypair_file).unwrap().into(),
@@ -2002,7 +1936,7 @@ mod tests {
         assert_eq!(
             parse_command(&test_resolve_signer, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
-                command: CliCommand::ResolveSigner(Some(keypair_file.clone())),
+                command: CliCommand::ResolveSigner(Some(keypair_file)),
                 signers: vec![],
             }
         );
@@ -2078,7 +2012,10 @@ mod tests {
         assert!(result.is_ok());
 
         let vote_account_info_response = json!(Response {
-            context: RpcResponseContext { slot: 1 },
+            context: RpcResponseContext {
+                slot: 1,
+                api_version: None
+            },
             value: json!({
                 "data": ["KLUv/QBYNQIAtAIBAAAAbnoc3Smwt4/ROvTFWY/v9O8qlxZuPKby5Pv8zYBQW/EFAAEAAB8ACQD6gx92zAiAAecDP4B2XeEBSIx7MQeung==", "base64+zstd"],
                 "lamports": 42,
@@ -2187,6 +2124,7 @@ mod tests {
             stake_authority: 0,
             sign_only: false,
             dump_transaction_message: false,
+            deactivate_delinquent: false,
             blockhash_query: BlockhashQuery::default(),
             nonce_account: None,
             nonce_authority: 0,
@@ -2363,7 +2301,10 @@ mod tests {
         // Success case
         let mut config = CliConfig::default();
         let account_info_response = json!(Response {
-            context: RpcResponseContext { slot: 1 },
+            context: RpcResponseContext {
+                slot: 1,
+                api_version: None
+            },
             value: Value::Null,
         });
         let mut mocks = HashMap::new();
@@ -2379,6 +2320,7 @@ mod tests {
             address: None,
             use_deprecated_loader: false,
             allow_excessive_balance: false,
+            skip_fee_check: false,
         };
         config.output_format = OutputFormat::JsonCompact;
         let result = process_command(&config);
@@ -2399,6 +2341,7 @@ mod tests {
             address: None,
             use_deprecated_loader: false,
             allow_excessive_balance: false,
+            skip_fee_check: false,
         };
         assert!(process_command(&config).is_err());
     }

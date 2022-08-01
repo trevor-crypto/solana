@@ -1,4 +1,4 @@
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(not(target_os = "solana"))]
 use {
     aes_gcm_siv::{
         aead::{Aead, NewAead},
@@ -15,19 +15,19 @@ use {
         signature::Signature,
         signer::{Signer, SignerError},
     },
-    std::convert::TryInto,
+    std::{convert::TryInto, fmt},
     zeroize::Zeroize,
 };
 
 struct AuthenticatedEncryption;
 impl AuthenticatedEncryption {
-    #[cfg(not(target_arch = "bpf"))]
+    #[cfg(not(target_os = "solana"))]
     #[allow(clippy::new_ret_no_self)]
     fn keygen<T: RngCore + CryptoRng>(rng: &mut T) -> AeKey {
         AeKey(rng.gen::<[u8; 16]>())
     }
 
-    #[cfg(not(target_arch = "bpf"))]
+    #[cfg(not(target_os = "solana"))]
     fn encrypt(key: &AeKey, balance: u64) -> AeCiphertext {
         let mut plaintext = balance.to_le_bytes();
         let nonce: Nonce = OsRng.gen::<[u8; 12]>();
@@ -45,7 +45,7 @@ impl AuthenticatedEncryption {
         }
     }
 
-    #[cfg(not(target_arch = "bpf"))]
+    #[cfg(not(target_os = "solana"))]
     fn decrypt(key: &AeKey, ct: &AeCiphertext) -> Option<u64> {
         let plaintext =
             Aes128GcmSiv::new(&key.0.into()).decrypt(&ct.nonce.into(), ct.ciphertext.as_ref());
@@ -97,7 +97,7 @@ pub type Nonce = [u8; 12];
 pub type Ciphertext = [u8; 24];
 
 /// Authenticated encryption nonce and ciphertext
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AeCiphertext {
     pub nonce: Nonce,
     pub ciphertext: Ciphertext,
@@ -126,6 +126,12 @@ impl AeCiphertext {
             nonce: *nonce,
             ciphertext: *ciphertext,
         })
+    }
+}
+
+impl fmt::Display for AeCiphertext {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", base64::encode(self.to_bytes()))
     }
 }
 

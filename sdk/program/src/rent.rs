@@ -1,9 +1,17 @@
+//! Configuration for network [rent].
+//!
+//! [rent]: https://docs.solana.com/implemented-proposals/rent
+
 #![allow(clippy::integer_arithmetic)]
 //! configuration for network rent
-use crate::clock::DEFAULT_SLOTS_PER_EPOCH;
+
+use {
+    crate::{clock::DEFAULT_SLOTS_PER_EPOCH, clone_zeroed, copy_field},
+    std::mem::MaybeUninit,
+};
 
 #[repr(C)]
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, AbiExample)]
+#[derive(Serialize, Deserialize, PartialEq, Copy, Debug, AbiExample)]
 pub struct Rent {
     /// Rental rate
     pub lamports_per_byte_year: u64,
@@ -41,6 +49,19 @@ impl Default for Rent {
     }
 }
 
+impl Clone for Rent {
+    fn clone(&self) -> Self {
+        clone_zeroed(|cloned: &mut MaybeUninit<Self>| {
+            let ptr = cloned.as_mut_ptr();
+            unsafe {
+                copy_field!(ptr, self, lamports_per_byte_year);
+                copy_field!(ptr, self, exemption_threshold);
+                copy_field!(ptr, self, burn_percent);
+            }
+        })
+    }
+}
+
 impl Rent {
     /// calculate how much rent to burn from the collected rent
     pub fn calculate_burn(&self, rent_collected: u64) -> (u64, u64) {
@@ -68,10 +89,15 @@ impl Rent {
         if self.is_exempt(balance, data_len) {
             RentDue::Exempt
         } else {
-            let actual_data_len = data_len as u64 + ACCOUNT_STORAGE_OVERHEAD;
-            let lamports_per_year = self.lamports_per_byte_year * actual_data_len;
-            RentDue::Paying((lamports_per_year as f64 * years_elapsed) as u64)
+            RentDue::Paying(self.due_amount(data_len, years_elapsed))
         }
+    }
+
+    /// rent due for account that is known to be not exempt
+    pub fn due_amount(&self, data_len: usize, years_elapsed: f64) -> u64 {
+        let actual_data_len = data_len as u64 + ACCOUNT_STORAGE_OVERHEAD;
+        let lamports_per_year = self.lamports_per_byte_year * actual_data_len;
+        (lamports_per_year as f64 * years_elapsed) as u64
     }
 
     pub fn free() -> Self {
@@ -182,5 +208,17 @@ mod tests {
     fn test_rent_due_is_exempt() {
         assert!(RentDue::Exempt.is_exempt());
         assert!(!RentDue::Paying(0).is_exempt());
+    }
+
+    #[test]
+    fn test_clone() {
+        let rent = Rent {
+            lamports_per_byte_year: 1,
+            exemption_threshold: 2.2,
+            burn_percent: 3,
+        };
+        #[allow(clippy::clone_on_copy)]
+        let cloned_rent = rent.clone();
+        assert_eq!(cloned_rent, rent);
     }
 }

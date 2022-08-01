@@ -10,8 +10,7 @@ use {
     },
     solana_entry::entry::Entry,
     solana_ledger::shred::{
-        ProcessShredsStats, Shred, Shredder, MAX_DATA_SHREDS_PER_FEC_BLOCK,
-        SHRED_TICK_REFERENCE_MASK,
+        ProcessShredsStats, Shred, ShredFlags, Shredder, MAX_DATA_SHREDS_PER_FEC_BLOCK,
     },
     solana_sdk::{
         signature::Keypair,
@@ -63,6 +62,7 @@ impl StandardBroadcastRun {
         max_ticks_in_slot: u8,
         stats: &mut ProcessShredsStats,
     ) -> Vec<Shred> {
+        const SHRED_TICK_REFERENCE_MASK: u8 = ShredFlags::SHRED_TICK_REFERENCE_MASK.bits();
         let (current_slot, _) = self.current_slot_and_parent.unwrap();
         match self.unfinished_slot {
             None => Vec::default(),
@@ -70,20 +70,23 @@ impl StandardBroadcastRun {
             Some(ref mut state) => {
                 let parent_offset = state.slot - state.parent;
                 let reference_tick = max_ticks_in_slot & SHRED_TICK_REFERENCE_MASK;
-                let fec_set_index =
-                    Shredder::fec_set_index(state.next_shred_index, state.fec_set_offset);
+                let fec_set_offset = state
+                    .data_shreds_buffer
+                    .first()
+                    .map(Shred::index)
+                    .unwrap_or(state.next_shred_index);
+                let fec_set_index = Shredder::fec_set_index(state.next_shred_index, fec_set_offset);
                 let mut shred = Shred::new_from_data(
                     state.slot,
                     state.next_shred_index,
                     parent_offset as u16,
-                    None, // data
-                    true, // is_last_in_fec_set
-                    true, // is_last_in_slot
+                    &[], // data
+                    ShredFlags::LAST_SHRED_IN_SLOT,
                     reference_tick,
                     self.shred_version,
                     fec_set_index.unwrap(),
                 );
-                Shredder::sign_shred(keypair, &mut shred);
+                shred.sign(keypair);
                 state.data_shreds_buffer.push(shred.clone());
                 let mut shreds = make_coding_shreds(
                     keypair,
@@ -109,15 +112,22 @@ impl StandardBroadcastRun {
         process_stats: &mut ProcessShredsStats,
     ) -> Vec<Shred> {
         let (slot, parent_slot) = self.current_slot_and_parent.unwrap();
-        let (next_shred_index, fec_set_offset) = match &self.unfinished_slot {
-            Some(state) => (state.next_shred_index, state.fec_set_offset),
-            None => match blockstore.meta(slot).unwrap() {
-                Some(slot_meta) => {
-                    let shreds_consumed = slot_meta.consumed as u32;
-                    (shreds_consumed, shreds_consumed)
+        let next_shred_index = match &self.unfinished_slot {
+            Some(state) => state.next_shred_index,
+            None => {
+                // If the blockstore has shreds for the slot, it should not
+                // recreate the slot:
+                // https://github.com/solana-labs/solana/blob/ff68bf6c2/ledger/src/leader_schedule_cache.rs#L142-L146
+                if let Some(slot_meta) = blockstore.meta(slot).unwrap() {
+                    if slot_meta.received > 0 || slot_meta.consumed > 0 {
+                        process_stats.num_extant_slots += 1;
+                        // This is a faulty situation that should not happen.
+                        // Refrain from generating shreds for the slot.
+                        return Vec::default();
+                    }
                 }
-                None => (0, 0),
-            },
+                0u32
+            }
         };
         let data_shreds = Shredder::new(slot, parent_slot, reference_tick, self.shred_version)
             .unwrap()
@@ -126,7 +136,7 @@ impl StandardBroadcastRun {
                 entries,
                 is_slot_end,
                 next_shred_index,
-                fec_set_offset,
+                0, // fec_set_offset
                 process_stats,
             );
         let mut data_shreds_buffer = match &mut self.unfinished_slot {
@@ -151,7 +161,6 @@ impl StandardBroadcastRun {
             slot,
             parent: parent_slot,
             data_shreds_buffer,
-            fec_set_offset,
         });
         data_shreds
     }
@@ -162,9 +171,9 @@ impl StandardBroadcastRun {
         keypair: &Keypair,
         cluster_info: &ClusterInfo,
         sock: &UdpSocket,
-        blockstore: &Arc<Blockstore>,
+        blockstore: &Blockstore,
         receive_results: ReceiveResults,
-        bank_forks: &Arc<RwLock<BankForks>>,
+        bank_forks: &RwLock<BankForks>,
     ) -> Result<()> {
         let (bsend, brecv) = unbounded();
         let (ssend, srecv) = unbounded();
@@ -184,7 +193,7 @@ impl StandardBroadcastRun {
     fn process_receive_results(
         &mut self,
         keypair: &Keypair,
-        blockstore: &Arc<Blockstore>,
+        blockstore: &Blockstore,
         socket_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
         blockstore_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
         receive_results: ReceiveResults,
@@ -227,13 +236,21 @@ impl StandardBroadcastRun {
             is_last_in_slot,
             &mut process_stats,
         );
-        // Insert the first shred so blockstore stores that the leader started this block
-        // This must be done before the blocks are sent out over the wire.
-        if !data_shreds.is_empty() && data_shreds[0].index() == 0 {
-            let first = vec![data_shreds[0].clone()];
-            blockstore
-                .insert_shreds(first, None, true)
-                .expect("Failed to insert shreds in blockstore");
+        // Insert the first data shred synchronously so that blockstore stores
+        // that the leader started this block. This must be done before the
+        // blocks are sent out over the wire. By contrast Self::insert skips
+        // the 1st data shred with index zero.
+        // https://github.com/solana-labs/solana/blob/53695ecd2/core/src/broadcast_stage/standard_broadcast_run.rs#L334-L339
+        if let Some(shred) = data_shreds.first() {
+            if shred.index() == 0 {
+                blockstore
+                    .insert_shreds(
+                        vec![shred.clone()],
+                        None, // leader_schedule
+                        true, // is_trusted
+                    )
+                    .expect("Failed to insert shreds in blockstore");
+            }
         }
         to_shreds_time.stop();
 
@@ -304,7 +321,7 @@ impl StandardBroadcastRun {
         process_stats.receive_elapsed = duration_as_us(&receive_elapsed);
         process_stats.coding_send_elapsed = coding_send_time.as_us();
 
-        self.process_shreds_stats.update(&process_stats);
+        self.process_shreds_stats += process_stats;
 
         if last_tick_height == bank.max_tick_height() {
             self.report_and_reset_stats(false);
@@ -316,25 +333,30 @@ impl StandardBroadcastRun {
 
     fn insert(
         &mut self,
-        blockstore: &Arc<Blockstore>,
+        blockstore: &Blockstore,
         shreds: Arc<Vec<Shred>>,
         broadcast_shred_batch_info: Option<BroadcastShredBatchInfo>,
     ) {
         // Insert shreds into blockstore
         let insert_shreds_start = Instant::now();
-        // The first shred is inserted synchronously
-        let data_shreds = if !shreds.is_empty() && shreds[0].index() == 0 {
-            shreds[1..].to_vec()
-        } else {
-            shreds.to_vec()
-        };
+        let mut shreds = Arc::try_unwrap(shreds).unwrap_or_else(|shreds| (*shreds).clone());
+        // The first data shred is inserted synchronously.
+        // https://github.com/solana-labs/solana/blob/53695ecd2/core/src/broadcast_stage/standard_broadcast_run.rs#L239-L246
+        if let Some(shred) = shreds.first() {
+            if shred.is_data() && shred.index() == 0 {
+                shreds.swap_remove(0);
+            }
+        }
+        let num_shreds = shreds.len();
         blockstore
-            .insert_shreds(data_shreds, None, true)
+            .insert_shreds(
+                shreds, /*leader_schedule:*/ None, /*is_trusted:*/ true,
+            )
             .expect("Failed to insert shreds in blockstore");
         let insert_shreds_elapsed = insert_shreds_start.elapsed();
         let new_insert_shreds_stats = InsertShredsStats {
             insert_shreds_elapsed: duration_as_us(&insert_shreds_elapsed),
-            num_shreds: shreds.len(),
+            num_shreds,
         };
         self.update_insertion_metrics(&new_insert_shreds_stats, &broadcast_shred_batch_info);
     }
@@ -354,7 +376,7 @@ impl StandardBroadcastRun {
         cluster_info: &ClusterInfo,
         shreds: Arc<Vec<Shred>>,
         broadcast_shred_batch_info: Option<BroadcastShredBatchInfo>,
-        bank_forks: &Arc<RwLock<BankForks>>,
+        bank_forks: &RwLock<BankForks>,
     ) -> Result<()> {
         trace!("Broadcasting {:?} shreds", shreds.len());
         let mut transmit_stats = TransmitShredsStats::default();
@@ -391,59 +413,23 @@ impl StandardBroadcastRun {
     }
 
     fn report_and_reset_stats(&mut self, was_interrupted: bool) {
-        let stats = &self.process_shreds_stats;
         let unfinished_slot = self.unfinished_slot.as_ref().unwrap();
         if was_interrupted {
-            datapoint_info!(
+            self.process_shreds_stats.submit(
                 "broadcast-process-shreds-interrupted-stats",
-                ("slot", unfinished_slot.slot as i64, i64),
-                ("shredding_time", stats.shredding_elapsed, i64),
-                ("receive_time", stats.receive_elapsed, i64),
-                (
-                    "num_data_shreds",
-                    unfinished_slot.next_shred_index as i64,
-                    i64
-                ),
-                (
-                    "get_leader_schedule_time",
-                    stats.get_leader_schedule_elapsed,
-                    i64
-                ),
-                ("serialize_shreds_time", stats.serialize_elapsed, i64),
-                ("gen_data_time", stats.gen_data_elapsed, i64),
-                ("gen_coding_time", stats.gen_coding_elapsed, i64),
-                ("sign_coding_time", stats.sign_coding_elapsed, i64),
-                ("coding_send_time", stats.coding_send_elapsed, i64),
+                unfinished_slot.slot,
+                unfinished_slot.next_shred_index, // num_data_shreds,
+                None,                             // slot_broadcast_time
             );
         } else {
-            datapoint_info!(
+            let slot_broadcast_time = self.slot_broadcast_start.unwrap().elapsed();
+            self.process_shreds_stats.submit(
                 "broadcast-process-shreds-stats",
-                ("slot", unfinished_slot.slot as i64, i64),
-                ("shredding_time", stats.shredding_elapsed, i64),
-                ("receive_time", stats.receive_elapsed, i64),
-                (
-                    "num_data_shreds",
-                    unfinished_slot.next_shred_index as i64,
-                    i64
-                ),
-                (
-                    "slot_broadcast_time",
-                    self.slot_broadcast_start.unwrap().elapsed().as_micros() as i64,
-                    i64
-                ),
-                (
-                    "get_leader_schedule_time",
-                    stats.get_leader_schedule_elapsed,
-                    i64
-                ),
-                ("serialize_shreds_time", stats.serialize_elapsed, i64),
-                ("gen_data_time", stats.gen_data_elapsed, i64),
-                ("gen_coding_time", stats.gen_coding_elapsed, i64),
-                ("sign_coding_time", stats.sign_coding_elapsed, i64),
-                ("coding_send_time", stats.coding_send_elapsed, i64),
+                unfinished_slot.slot,
+                unfinished_slot.next_shred_index, // num_data_shreds,
+                Some(slot_broadcast_time),
             );
         }
-        self.process_shreds_stats.reset();
     }
 }
 
@@ -494,7 +480,7 @@ impl BroadcastRun for StandardBroadcastRun {
     fn run(
         &mut self,
         keypair: &Keypair,
-        blockstore: &Arc<Blockstore>,
+        blockstore: &Blockstore,
         receiver: &Receiver<WorkingBankEntry>,
         socket_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
         blockstore_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
@@ -512,19 +498,15 @@ impl BroadcastRun for StandardBroadcastRun {
     }
     fn transmit(
         &mut self,
-        receiver: &Arc<Mutex<TransmitReceiver>>,
+        receiver: &Mutex<TransmitReceiver>,
         cluster_info: &ClusterInfo,
         sock: &UdpSocket,
-        bank_forks: &Arc<RwLock<BankForks>>,
+        bank_forks: &RwLock<BankForks>,
     ) -> Result<()> {
         let (shreds, batch_info) = receiver.lock().unwrap().recv()?;
         self.broadcast(sock, cluster_info, shreds, batch_info, bank_forks)
     }
-    fn record(
-        &mut self,
-        receiver: &Arc<Mutex<RecordReceiver>>,
-        blockstore: &Arc<Blockstore>,
-    ) -> Result<()> {
+    fn record(&mut self, receiver: &Mutex<RecordReceiver>, blockstore: &Blockstore) -> Result<()> {
         let (shreds, slot_start_ts) = receiver.lock().unwrap().recv()?;
         self.insert(blockstore, shreds, slot_start_ts);
         Ok(())
@@ -608,7 +590,6 @@ mod test {
             slot,
             parent,
             data_shreds_buffer: Vec::default(),
-            fec_set_offset: next_shred_index,
         });
         run.slot_broadcast_start = Some(Instant::now());
 

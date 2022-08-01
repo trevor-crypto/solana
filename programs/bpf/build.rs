@@ -1,7 +1,9 @@
 extern crate walkdir;
 
-use std::{env, path::Path, process::Command};
-use walkdir::WalkDir;
+use {
+    std::{env, path::Path, process::Command},
+    walkdir::WalkDir,
+};
 
 fn rerun_if_changed(files: &[&str], directories: &[&str], excludes: &[&str]) {
     let mut all_files: Vec<_> = files.iter().map(|f| f.to_string()).collect();
@@ -37,8 +39,7 @@ fn rerun_if_changed(files: &[&str], directories: &[&str], excludes: &[&str]) {
 fn main() {
     let bpf_c = env::var("CARGO_FEATURE_BPF_C").is_ok();
     if bpf_c {
-        let install_dir =
-            "OUT_DIR=../target/".to_string() + &env::var("PROFILE").unwrap() + &"/bpf".to_string();
+        let install_dir = "OUT_DIR=../target/".to_string() + &env::var("PROFILE").unwrap() + "/bpf";
 
         println!("cargo:warning=(not a warning) Building C-based BPF programs");
         assert!(Command::new("make")
@@ -54,14 +55,14 @@ fn main() {
 
     let bpf_rust = env::var("CARGO_FEATURE_BPF_RUST").is_ok();
     if bpf_rust {
-        let install_dir =
-            "target/".to_string() + &env::var("PROFILE").unwrap() + &"/bpf".to_string();
+        let install_dir = "target/".to_string() + &env::var("PROFILE").unwrap() + "/bpf";
 
         let rust_programs = [
             "128bit",
             "alloc",
             "call_depth",
             "caller_access",
+            "curve25519",
             "custom_heap",
             "dep_crate",
             "deprecated_loader",
@@ -70,6 +71,8 @@ fn main() {
             "log_data",
             "external_spend",
             "finalize",
+            "get_minimum_delegation",
+            "inner_instruction_alignment_check",
             "instruction_introspection",
             "invoke",
             "invoke_and_error",
@@ -91,11 +94,13 @@ fn main() {
             "sanity",
             "secp256k1_recover",
             "sha",
+            "sibling_inner_instruction",
+            "sibling_instruction",
+            "simulation",
             "spoof1",
             "spoof1_system",
             "upgradeable",
             "upgraded",
-            "zk_token_elgamal",
         ];
         for program in rust_programs.iter() {
             println!(

@@ -20,9 +20,9 @@ use {
         offline::*,
     },
     solana_cli_output::{
-        display::build_balance_message, return_signers_with_config, CliAccount,
-        CliSignatureVerificationStatus, CliTransaction, CliTransactionConfirmation, OutputFormat,
-        ReturnSignersConfig,
+        display::{build_balance_message, BuildBalanceMessageConfig},
+        return_signers_with_config, CliAccount, CliBalance, CliSignatureVerificationStatus,
+        CliTransaction, CliTransactionConfirmation, OutputFormat, ReturnSignersConfig,
     },
     solana_client::{
         blockhash_query::BlockhashQuery, nonce_utils, rpc_client::RpcClient,
@@ -37,9 +37,12 @@ use {
         stake,
         system_instruction::{self, SystemError},
         system_program,
-        transaction::Transaction,
+        transaction::{Transaction, VersionedTransaction},
     },
-    solana_transaction_status::{Encodable, EncodedTransaction, UiTransactionEncoding},
+    solana_transaction_status::{
+        EncodableWithMeta, EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
+        TransactionBinaryEncoding, UiTransactionEncoding,
+    },
     std::{fmt::Write as FmtWrite, fs::File, io::Write, sync::Arc},
 };
 
@@ -189,7 +192,7 @@ impl WalletSubCommands for App<'_, '_> {
                     Arg::with_name("encoding")
                         .index(2)
                         .value_name("ENCODING")
-                        .possible_values(&["base58", "base64"]) // Subset of `UiTransactionEncoding` enum
+                        .possible_values(&["base58", "base64"]) // Variants of `TransactionBinaryEncoding` enum
                         .default_value("base58")
                         .takes_value(true)
                         .required(true)
@@ -273,11 +276,14 @@ impl WalletSubCommands for App<'_, '_> {
 }
 
 fn resolve_derived_address_program_id(matches: &ArgMatches<'_>, arg_name: &str) -> Option<Pubkey> {
-    matches.value_of(arg_name).and_then(|v| match v {
-        "NONCE" => Some(system_program::id()),
-        "STAKE" => Some(stake::program::id()),
-        "VOTE" => Some(solana_vote_program::id()),
-        _ => pubkey_of(matches, arg_name),
+    matches.value_of(arg_name).and_then(|v| {
+        let upper = v.to_ascii_uppercase();
+        match upper.as_str() {
+            "NONCE" | "SYSTEM" => Some(system_program::id()),
+            "STAKE" => Some(stake::program::id()),
+            "VOTE" => Some(solana_vote_program::id()),
+            _ => pubkey_of(matches, arg_name),
+        }
     })
 }
 
@@ -338,13 +344,13 @@ pub fn parse_balance(
 
 pub fn parse_decode_transaction(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
     let blob = value_t_or_exit!(matches, "transaction", String);
-    let encoding = match matches.value_of("encoding").unwrap() {
-        "base58" => UiTransactionEncoding::Base58,
-        "base64" => UiTransactionEncoding::Base64,
+    let binary_encoding = match matches.value_of("encoding").unwrap() {
+        "base58" => TransactionBinaryEncoding::Base58,
+        "base64" => TransactionBinaryEncoding::Base64,
         _ => unreachable!(),
     };
 
-    let encoded_transaction = EncodedTransaction::Binary(blob, encoding);
+    let encoded_transaction = EncodedTransaction::Binary(blob, binary_encoding);
     if let Some(transaction) = encoded_transaction.decode() {
         Ok(CliCommandInfo {
             command: CliCommand::DecodeTransaction(transaction),
@@ -537,7 +543,16 @@ pub fn process_balance(
         config.pubkey()?
     };
     let balance = rpc_client.get_balance(&pubkey)?;
-    Ok(build_balance_message(balance, use_lamports_unit, true))
+    let balance_output = CliBalance {
+        lamports: balance,
+        config: BuildBalanceMessageConfig {
+            use_lamports_unit,
+            show_unit: true,
+            trim_trailing_zeros: true,
+        },
+    };
+
+    Ok(config.output_format.formatted_string(&balance_output))
 }
 
 pub fn process_confirm(
@@ -556,22 +571,25 @@ pub fn process_confirm(
                         RpcTransactionConfig {
                             encoding: Some(UiTransactionEncoding::Base64),
                             commitment: Some(CommitmentConfig::confirmed()),
+                            max_supported_transaction_version: Some(0),
                         },
                     ) {
                         Ok(confirmed_transaction) => {
-                            let decoded_transaction = confirmed_transaction
-                                .transaction
-                                .transaction
-                                .decode()
-                                .expect("Successful decode");
-                            let json_transaction =
-                                decoded_transaction.encode(UiTransactionEncoding::Json);
+                            let EncodedConfirmedTransactionWithStatusMeta {
+                                block_time,
+                                slot,
+                                transaction: transaction_with_meta,
+                            } = confirmed_transaction;
+
+                            let decoded_transaction =
+                                transaction_with_meta.transaction.decode().unwrap();
+                            let json_transaction = decoded_transaction.json_encode();
 
                             transaction = Some(CliTransaction {
                                 transaction: json_transaction,
-                                meta: confirmed_transaction.transaction.meta,
-                                block_time: confirmed_transaction.block_time,
-                                slot: Some(confirmed_transaction.slot),
+                                meta: transaction_with_meta.meta,
+                                block_time,
+                                slot: Some(slot),
                                 decoded_transaction,
                                 prefix: "  ".to_string(),
                                 sigverify_status: vec![],
@@ -603,11 +621,14 @@ pub fn process_confirm(
 }
 
 #[allow(clippy::unnecessary_wraps)]
-pub fn process_decode_transaction(config: &CliConfig, transaction: &Transaction) -> ProcessResult {
+pub fn process_decode_transaction(
+    config: &CliConfig,
+    transaction: &VersionedTransaction,
+) -> ProcessResult {
     let sigverify_status = CliSignatureVerificationStatus::verify_transaction(transaction);
     let decode_transaction = CliTransaction {
         decoded_transaction: transaction.clone(),
-        transaction: transaction.encode(UiTransactionEncoding::Json),
+        transaction: transaction.json_encode(),
         meta: None,
         block_time: None,
         slot: None,

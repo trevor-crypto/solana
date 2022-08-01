@@ -1,7 +1,7 @@
 use {
     crate::{
         args::{DistributeTokensArgs, SplTokenArgs},
-        commands::{Allocation, Error, FundingSource},
+        commands::{get_fees_for_messages, Allocation, Error, FundingSource},
     },
     console::style,
     solana_account_decoder::parse_token::{
@@ -10,7 +10,9 @@ use {
     solana_client::rpc_client::RpcClient,
     solana_sdk::{instruction::Instruction, message::Message, native_token::lamports_to_sol},
     solana_transaction_status::parse_token::spl_token_instruction,
-    spl_associated_token_account::{create_associated_token_account, get_associated_token_address},
+    spl_associated_token_account::{
+        get_associated_token_address, instruction::create_associated_token_account,
+    },
     spl_token::{
         solana_program::program_pack::Pack,
         state::{Account as SplTokenAccount, Mint},
@@ -93,14 +95,7 @@ pub fn check_spl_token_balances(
         .as_ref()
         .expect("spl_token_args must be some");
     let allocation_amount: u64 = allocations.iter().map(|x| x.amount).sum();
-
-    let fees: u64 = messages
-        .iter()
-        .map(|message| client.get_fee_for_message(message))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
-        .iter()
-        .sum();
+    let fees = get_fees_for_messages(messages, client)?;
 
     let token_account_rent_exempt_balance =
         client.get_minimum_balance_for_rent_exemption(SplTokenAccount::LEN)?;

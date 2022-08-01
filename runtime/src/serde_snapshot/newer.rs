@@ -1,16 +1,26 @@
 use {
     super::{
-        common::UnusedAccounts,
         storage::SerializableAccountStorageEntry,
         utils::{serialize_iter_as_map, serialize_iter_as_seq},
         *,
     },
-    crate::{ancestors::AncestorsForSerialization, stakes::StakesCache},
+    crate::{
+        ancestors::AncestorsForSerialization,
+        stakes::{serde_stakes_enum_compat, StakesEnum},
+    },
     solana_measure::measure::Measure,
-    std::{cell::RefCell, sync::RwLock},
+    solana_sdk::{deserialize_utils::ignore_eof_error, stake::state::Delegation},
+    std::{cell::RefCell, collections::HashSet, sync::RwLock},
 };
 
-type AccountsDbFields = super::AccountsDbFields<SerializableAccountStorageEntry>;
+pub(super) type AccountsDbFields = super::AccountsDbFields<SerializableAccountStorageEntry>;
+
+#[derive(Default, Clone, PartialEq, Eq, Debug, Deserialize, Serialize, AbiExample)]
+struct UnusedAccounts {
+    unused1: HashSet<Pubkey>,
+    unused2: HashSet<Pubkey>,
+    unused3: HashMap<Pubkey, u64>,
+}
 
 // Deserializable version of Bank which need not be serializable,
 // because it's handled by SerializableVersionedBank.
@@ -33,8 +43,7 @@ struct DeserializableVersionedBank {
     ns_per_slot: u128,
     genesis_creation_time: UnixTimestamp,
     slots_per_year: f64,
-    #[allow(dead_code)]
-    unused: u64,
+    accounts_data_len: u64,
     slot: Slot,
     epoch: Epoch,
     block_height: u64,
@@ -46,7 +55,7 @@ struct DeserializableVersionedBank {
     rent_collector: RentCollector,
     epoch_schedule: EpochSchedule,
     inflation: Inflation,
-    stakes: Stakes,
+    stakes: Stakes<Delegation>,
     #[allow(dead_code)]
     unused_accounts: UnusedAccounts,
     epoch_stakes: HashMap<Epoch, EpochStakes>,
@@ -72,6 +81,7 @@ impl From<DeserializableVersionedBank> for BankFieldsToDeserialize {
             ns_per_slot: dvb.ns_per_slot,
             genesis_creation_time: dvb.genesis_creation_time,
             slots_per_year: dvb.slots_per_year,
+            accounts_data_len: dvb.accounts_data_len,
             slot: dvb.slot,
             epoch: dvb.epoch,
             block_height: dvb.block_height,
@@ -110,7 +120,7 @@ struct SerializableVersionedBank<'a> {
     ns_per_slot: u128,
     genesis_creation_time: UnixTimestamp,
     slots_per_year: f64,
-    unused: u64,
+    accounts_data_len: u64,
     slot: Slot,
     epoch: Epoch,
     block_height: u64,
@@ -122,7 +132,8 @@ struct SerializableVersionedBank<'a> {
     rent_collector: RentCollector,
     epoch_schedule: EpochSchedule,
     inflation: Inflation,
-    stakes: &'a StakesCache,
+    #[serde(serialize_with = "serde_stakes_enum_compat::serialize")]
+    stakes: StakesEnum,
     unused_accounts: UnusedAccounts,
     epoch_stakes: &'a HashMap<Epoch, EpochStakes>,
     is_delta: bool,
@@ -147,7 +158,7 @@ impl<'a> From<crate::bank::BankFieldsToSerialize<'a>> for SerializableVersionedB
             ns_per_slot: rhs.ns_per_slot,
             genesis_creation_time: rhs.genesis_creation_time,
             slots_per_year: rhs.slots_per_year,
-            unused: u64::default(),
+            accounts_data_len: rhs.accounts_data_len,
             slot: rhs.slot,
             epoch: rhs.epoch,
             block_height: rhs.block_height,
@@ -159,7 +170,7 @@ impl<'a> From<crate::bank::BankFieldsToSerialize<'a>> for SerializableVersionedB
             rent_collector: rhs.rent_collector,
             epoch_schedule: rhs.epoch_schedule,
             inflation: rhs.inflation,
-            stakes: rhs.stakes,
+            stakes: StakesEnum::from(rhs.stakes.stakes().clone()),
             unused_accounts: UnusedAccounts::default(),
             epoch_stakes: rhs.epoch_stakes,
             is_delta: rhs.is_delta,
@@ -170,6 +181,7 @@ impl<'a> From<crate::bank::BankFieldsToSerialize<'a>> for SerializableVersionedB
 #[cfg(RUSTC_WITH_SPECIALIZATION)]
 impl<'a> solana_frozen_abi::abi_example::IgnoreAsHelper for SerializableVersionedBank<'a> {}
 
+#[derive(PartialEq, Eq)]
 pub(super) struct Context {}
 
 impl<'a> TypeContext<'a> for Context {
@@ -178,6 +190,33 @@ impl<'a> TypeContext<'a> for Context {
     fn serialize_bank_and_storage<S: serde::ser::Serializer>(
         serializer: S,
         serializable_bank: &SerializableBankAndStorage<'a, Self>,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        Self: std::marker::Sized,
+    {
+        let ancestors = HashMap::from(&serializable_bank.bank.ancestors);
+        let fields = serializable_bank.bank.get_fields_to_serialize(&ancestors);
+        let lamports_per_signature = fields.fee_rate_governor.lamports_per_signature;
+        (
+            SerializableVersionedBank::from(fields),
+            SerializableAccountsDb::<'a, Self> {
+                accounts_db: &*serializable_bank.bank.rc.accounts.accounts_db,
+                slot: serializable_bank.bank.rc.slot,
+                account_storage_entries: serializable_bank.snapshot_storages,
+                phantom: std::marker::PhantomData::default(),
+            },
+            // Additional fields, we manually store the lamps per signature here so that
+            // we can grab it on restart.
+            // TODO: if we do a snapshot version bump, consider moving this out.
+            lamports_per_signature,
+        )
+            .serialize(serializer)
+    }
+
+    #[cfg(test)]
+    fn serialize_bank_and_storage_without_extra_fields<S: serde::ser::Serializer>(
+        serializer: S,
+        serializable_bank: &SerializableBankAndStorageNoExtra<'a, Self>,
     ) -> std::result::Result<S::Ok, S::Error>
     where
         Self: std::marker::Sized,
@@ -223,7 +262,7 @@ impl<'a> TypeContext<'a> for Context {
                 )
             }));
         let slot = serializable_db.slot;
-        let hash = serializable_db
+        let hash: BankHashInfo = serializable_db
             .accounts_db
             .bank_hashes
             .read()
@@ -232,8 +271,26 @@ impl<'a> TypeContext<'a> for Context {
             .unwrap_or_else(|| panic!("No bank_hashes entry for slot {}", serializable_db.slot))
             .clone();
 
+        let historical_roots = serializable_db
+            .accounts_db
+            .accounts_index
+            .roots_tracker
+            .read()
+            .unwrap()
+            .historical_roots
+            .get_all();
+        let historical_roots_with_hash = Vec::<(Slot, Hash)>::default();
+
         let mut serialize_account_storage_timer = Measure::start("serialize_account_storage_ms");
-        let result = (entries, version, slot, hash).serialize(serializer);
+        let result = (
+            entries,
+            version,
+            slot,
+            hash,
+            historical_roots,
+            historical_roots_with_hash,
+        )
+            .serialize(serializer);
         serialize_account_storage_timer.stop();
         datapoint_info!(
             "serialize_account_storage_ms",
@@ -249,8 +306,14 @@ impl<'a> TypeContext<'a> for Context {
     where
         R: Read,
     {
-        let bank_fields = deserialize_from::<_, DeserializableVersionedBank>(&mut stream)?.into();
+        let mut bank_fields: BankFieldsToDeserialize =
+            deserialize_from::<_, DeserializableVersionedBank>(&mut stream)?.into();
         let accounts_db_fields = Self::deserialize_accounts_db_fields(stream)?;
+        // Process extra fields
+        let lamports_per_signature = ignore_eof_error(deserialize_from(&mut stream))?;
+        bank_fields.fee_rate_governor = bank_fields
+            .fee_rate_governor
+            .clone_with_lamports_per_signature(lamports_per_signature);
         Ok((bank_fields, accounts_db_fields))
     }
 
@@ -261,5 +324,65 @@ impl<'a> TypeContext<'a> for Context {
         R: Read,
     {
         deserialize_from(stream)
+    }
+
+    /// deserialize the bank from 'stream_reader'
+    /// modify the accounts_hash
+    /// reserialize the bank to 'stream_writer'
+    fn reserialize_bank_fields_with_hash<R, W>(
+        stream_reader: &mut BufReader<R>,
+        stream_writer: &mut BufWriter<W>,
+        accounts_hash: &Hash,
+    ) -> std::result::Result<(), Box<bincode::ErrorKind>>
+    where
+        R: Read,
+        W: Write,
+    {
+        let (bank_fields, mut accounts_db_fields) =
+            Self::deserialize_bank_fields(stream_reader).unwrap();
+        accounts_db_fields.3.snapshot_hash = *accounts_hash;
+        let rhs = bank_fields;
+        let blockhash_queue = RwLock::new(rhs.blockhash_queue.clone());
+        let hard_forks = RwLock::new(rhs.hard_forks.clone());
+        let lamports_per_signature = rhs.fee_rate_governor.lamports_per_signature;
+        let bank = SerializableVersionedBank {
+            blockhash_queue: &blockhash_queue,
+            ancestors: &rhs.ancestors,
+            hash: rhs.hash,
+            parent_hash: rhs.parent_hash,
+            parent_slot: rhs.parent_slot,
+            hard_forks: &hard_forks,
+            transaction_count: rhs.transaction_count,
+            tick_height: rhs.tick_height,
+            signature_count: rhs.signature_count,
+            capitalization: rhs.capitalization,
+            max_tick_height: rhs.max_tick_height,
+            hashes_per_tick: rhs.hashes_per_tick,
+            ticks_per_slot: rhs.ticks_per_slot,
+            ns_per_slot: rhs.ns_per_slot,
+            genesis_creation_time: rhs.genesis_creation_time,
+            slots_per_year: rhs.slots_per_year,
+            accounts_data_len: rhs.accounts_data_len,
+            slot: rhs.slot,
+            epoch: rhs.epoch,
+            block_height: rhs.block_height,
+            collector_id: rhs.collector_id,
+            collector_fees: rhs.collector_fees,
+            fee_calculator: rhs.fee_calculator,
+            fee_rate_governor: rhs.fee_rate_governor,
+            collected_rent: rhs.collected_rent,
+            rent_collector: rhs.rent_collector,
+            epoch_schedule: rhs.epoch_schedule,
+            inflation: rhs.inflation,
+            stakes: StakesEnum::from(rhs.stakes),
+            unused_accounts: UnusedAccounts::default(),
+            epoch_stakes: &rhs.epoch_stakes,
+            is_delta: rhs.is_delta,
+        };
+
+        bincode::serialize_into(
+            stream_writer,
+            &(bank, accounts_db_fields, lamports_per_signature),
+        )
     }
 }

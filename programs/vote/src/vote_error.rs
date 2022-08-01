@@ -8,7 +8,7 @@ use {
 };
 
 /// Reasons the vote might have had an error
-#[derive(Error, Debug, Clone, PartialEq, FromPrimitive, ToPrimitive)]
+#[derive(Error, Debug, Clone, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 pub enum VoteError {
     #[error("vote already recorded or not in slot hashes history")]
     VoteTooOld,
@@ -61,6 +61,12 @@ pub enum VoteError {
 
     #[error("every slot in the vote was older than the SlotHashes history")]
     VotesTooOldAllFiltered,
+
+    #[error("Proposed root is not in slot hashes")]
+    RootOnDifferentFork,
+
+    #[error("Cannot close vote account unless it stopped voting at least one full epoch ago")]
+    ActiveVoteAccountClose,
 }
 
 impl<E> DecodeError<E> for VoteError {

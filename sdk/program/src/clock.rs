@@ -1,4 +1,9 @@
-//! Provides information about the network's clock which is made up of ticks, slots, etc...
+//! Information about the network's clock, ticks, slots, etc.
+
+use {
+    crate::{clone_zeroed, copy_field},
+    std::mem::MaybeUninit,
+};
 
 // The default tick rate that the cluster attempts to achieve.  Note that the actual tick
 // rate at any given time should be expected to drift
@@ -57,7 +62,7 @@ pub const MAX_HASH_AGE_IN_SECONDS: usize = 120;
 
 #[cfg(test)]
 static_assertions::const_assert_eq!(MAX_RECENT_BLOCKHASHES, 300);
-// Number of maximum recent blockhashes (one blockhash per slot)
+// Number of maximum recent blockhashes (one blockhash per non-skipped slot)
 pub const MAX_RECENT_BLOCKHASHES: usize =
     MAX_HASH_AGE_IN_SECONDS * DEFAULT_TICKS_PER_SECOND as usize / DEFAULT_TICKS_PER_SLOT as usize;
 
@@ -105,7 +110,7 @@ pub type UnixTimestamp = i64;
 ///  as the network progresses).
 ///
 #[repr(C)]
-#[derive(Serialize, Clone, Deserialize, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct Clock {
     /// the current network/bank Slot
     pub slot: Slot,
@@ -120,4 +125,37 @@ pub struct Clock {
     /// in slots (drifty); corrected using validator timestamp oracle as of
     /// timestamp_correction and timestamp_bounding features
     pub unix_timestamp: UnixTimestamp,
+}
+
+impl Clone for Clock {
+    fn clone(&self) -> Self {
+        clone_zeroed(|cloned: &mut MaybeUninit<Self>| {
+            let ptr = cloned.as_mut_ptr();
+            unsafe {
+                copy_field!(ptr, self, slot);
+                copy_field!(ptr, self, epoch_start_timestamp);
+                copy_field!(ptr, self, epoch);
+                copy_field!(ptr, self, leader_schedule_epoch);
+                copy_field!(ptr, self, unix_timestamp);
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clone() {
+        let clock = Clock {
+            slot: 1,
+            epoch_start_timestamp: 2,
+            epoch: 3,
+            leader_schedule_epoch: 4,
+            unix_timestamp: 5,
+        };
+        let cloned_clock = clock.clone();
+        assert_eq!(cloned_clock, clock);
+    }
 }

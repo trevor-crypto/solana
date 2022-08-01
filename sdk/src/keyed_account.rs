@@ -1,13 +1,17 @@
+#![deprecated(
+    since = "1.11.0",
+    note = "Please use BorrowedAccount instead of KeyedAccount"
+)]
+#![allow(deprecated)]
 use {
     crate::{
-        account::{from_account, AccountSharedData, ReadableAccount},
+        account::{AccountSharedData, ReadableAccount},
         account_utils::{State, StateMut},
     },
-    solana_program::{clock::Epoch, instruction::InstructionError, pubkey::Pubkey, sysvar::Sysvar},
+    solana_program::{clock::Epoch, instruction::InstructionError, pubkey::Pubkey},
     std::{
         cell::{Ref, RefCell, RefMut},
         iter::FromIterator,
-        ops::Deref,
         rc::Rc,
     },
 };
@@ -199,6 +203,10 @@ pub fn create_keyed_accounts_unified<'a>(
         .collect()
 }
 
+#[deprecated(
+    since = "1.11.0",
+    note = "Please use InstructionContext::get_signers() instead"
+)]
 /// Return all the signers from a set of KeyedAccounts
 pub fn get_signers<A>(keyed_accounts: &[KeyedAccount]) -> A
 where
@@ -246,76 +254,5 @@ where
     }
     fn set_state(&self, state: &T) -> Result<(), InstructionError> {
         self.try_account_ref_mut()?.set_state(state)
-    }
-}
-
-pub fn check_sysvar_keyed_account<'a, S: Sysvar>(
-    keyed_account: &'a crate::keyed_account::KeyedAccount<'_>,
-) -> Result<impl Deref<Target = AccountSharedData> + 'a, InstructionError> {
-    if !S::check_id(keyed_account.unsigned_key()) {
-        return Err(InstructionError::InvalidArgument);
-    }
-    keyed_account.try_account_ref()
-}
-
-pub fn from_keyed_account<S: Sysvar>(
-    keyed_account: &crate::keyed_account::KeyedAccount,
-) -> Result<S, InstructionError> {
-    let sysvar_account = check_sysvar_keyed_account::<S>(keyed_account)?;
-    from_account::<S, AccountSharedData>(&*sysvar_account).ok_or(InstructionError::InvalidArgument)
-}
-
-#[cfg(test)]
-mod tests {
-    use {
-        super::*,
-        crate::{
-            account::{create_account_for_test, to_account},
-            pubkey::Pubkey,
-        },
-        std::cell::RefCell,
-    };
-
-    #[repr(C)]
-    #[derive(Serialize, Deserialize, Debug, Default, PartialEq)]
-    struct TestSysvar {
-        something: Pubkey,
-    }
-    crate::declare_id!("TestSysvar111111111111111111111111111111111");
-    impl solana_program::sysvar::SysvarId for TestSysvar {
-        fn id() -> crate::pubkey::Pubkey {
-            id()
-        }
-        fn check_id(pubkey: &crate::pubkey::Pubkey) -> bool {
-            check_id(pubkey)
-        }
-    }
-    impl Sysvar for TestSysvar {}
-
-    #[test]
-    fn test_sysvar_keyed_account_to_from() {
-        let test_sysvar = TestSysvar::default();
-        let key = crate::keyed_account::tests::id();
-        let wrong_key = Pubkey::new_unique();
-
-        let account = create_account_for_test(&test_sysvar);
-        let test_sysvar = from_account::<TestSysvar, _>(&account).unwrap();
-        assert_eq!(test_sysvar, TestSysvar::default());
-
-        let mut account = AccountSharedData::new(42, TestSysvar::size_of(), &key);
-        to_account(&test_sysvar, &mut account).unwrap();
-        let test_sysvar = from_account::<TestSysvar, _>(&account).unwrap();
-        assert_eq!(test_sysvar, TestSysvar::default());
-
-        let account = RefCell::new(account);
-        let keyed_account = KeyedAccount::new(&key, false, &account);
-        let new_test_sysvar = from_keyed_account::<TestSysvar>(&keyed_account).unwrap();
-        assert_eq!(test_sysvar, new_test_sysvar);
-
-        let keyed_account = KeyedAccount::new(&wrong_key, false, &account);
-        assert_eq!(
-            from_keyed_account::<TestSysvar>(&keyed_account),
-            Err(InstructionError::InvalidArgument)
-        );
     }
 }

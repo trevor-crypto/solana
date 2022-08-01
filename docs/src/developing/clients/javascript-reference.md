@@ -4,6 +4,10 @@ title: Web3 API Reference
 
 ## Web3 API Reference Guide
 
+The `@solana/web3.js` library is a package that has coverage over the [Solana JSON RPC API](https://docs.solana.com/developing/clients/jsonrpc-api).
+
+You can find the full documentation for the `@solana/web3.js` library [here](https://solana-labs.github.io/solana-web3.js/).
+
 ## General
 
 ### Connection
@@ -677,8 +681,8 @@ console.log(`Stake balance: ${stakeBalance}`)
 
 // We can verify the state of our stake. This may take some time to become active
 let stakeState = await connection.getStakeActivation(stakeAccount.publicKey);
-console.log(`Stake Stake: ${stakeState.state}`);
-// Stake State: inactive
+console.log(`Stake state: ${stakeState.state}`);
+// Stake state: inactive
 
 // To delegate our stake, we get the current vote accounts and choose the first
 let voteAccounts = await connection.getVoteAccounts();

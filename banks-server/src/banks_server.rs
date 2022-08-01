@@ -6,6 +6,7 @@ use {
         Banks, BanksRequest, BanksResponse, BanksTransactionResultWithSimulation,
         TransactionConfirmationStatus, TransactionSimulationDetails, TransactionStatus,
     },
+    solana_client::connection_cache::ConnectionCache,
     solana_runtime::{
         bank::{Bank, TransactionSimulationResult},
         bank_forks::BankForks,
@@ -161,6 +162,38 @@ fn verify_transaction(
     }
 }
 
+fn simulate_transaction(
+    bank: &Bank,
+    transaction: Transaction,
+) -> BanksTransactionResultWithSimulation {
+    let sanitized_transaction = match SanitizedTransaction::try_from_legacy_transaction(transaction)
+    {
+        Err(err) => {
+            return BanksTransactionResultWithSimulation {
+                result: Some(Err(err)),
+                simulation_details: None,
+            };
+        }
+        Ok(tx) => tx,
+    };
+    let TransactionSimulationResult {
+        result,
+        logs,
+        post_simulation_accounts: _,
+        units_consumed,
+        return_data,
+    } = bank.simulate_transaction_unchecked(sanitized_transaction);
+    let simulation_details = TransactionSimulationDetails {
+        logs,
+        units_consumed,
+        return_data,
+    };
+    BanksTransactionResultWithSimulation {
+        result: Some(result),
+        simulation_details: Some(simulation_details),
+    }
+}
+
 #[tarpc::server]
 impl Banks for BanksServer {
     async fn send_transaction_with_context(self, _: Context, transaction: Transaction) {
@@ -177,6 +210,7 @@ impl Banks for BanksServer {
             signature,
             serialize(&transaction).unwrap(),
             last_valid_block_height,
+            None,
             None,
             None,
         );
@@ -251,39 +285,25 @@ impl Banks for BanksServer {
         transaction: Transaction,
         commitment: CommitmentLevel,
     ) -> BanksTransactionResultWithSimulation {
-        let sanitized_transaction =
-            match SanitizedTransaction::try_from_legacy_transaction(transaction.clone()) {
-                Err(err) => {
-                    return BanksTransactionResultWithSimulation {
-                        result: Some(Err(err)),
-                        simulation_details: None,
-                    };
-                }
-                Ok(tx) => tx,
-            };
-        if let TransactionSimulationResult {
-            result: Err(err),
-            logs,
-            post_simulation_accounts: _,
-            units_consumed,
-        } = self
-            .bank(commitment)
-            .simulate_transaction_unchecked(sanitized_transaction)
-        {
-            return BanksTransactionResultWithSimulation {
-                result: Some(Err(err)),
-                simulation_details: Some(TransactionSimulationDetails {
-                    logs,
-                    units_consumed,
-                }),
-            };
-        }
-        BanksTransactionResultWithSimulation {
-            result: self
+        let mut simulation_result =
+            simulate_transaction(&self.bank(commitment), transaction.clone());
+        // Simulation was ok, so process the real transaction and replace the
+        // simulation's result with the real transaction result
+        if let Some(Ok(_)) = simulation_result.result {
+            simulation_result.result = self
                 .process_transaction_with_commitment_and_context(ctx, transaction, commitment)
-                .await,
-            simulation_details: None,
+                .await;
         }
+        simulation_result
+    }
+
+    async fn simulate_transaction_with_commitment_and_context(
+        self,
+        _: Context,
+        transaction: Transaction,
+        commitment: CommitmentLevel,
+    ) -> BanksTransactionResultWithSimulation {
+        simulate_transaction(&self.bank(commitment), transaction)
     }
 
     async fn process_transaction_with_commitment_and_context(
@@ -306,6 +326,7 @@ impl Banks for BanksServer {
             signature,
             serialize(&transaction).unwrap(),
             last_valid_block_height,
+            None,
             None,
             None,
         );
@@ -373,6 +394,7 @@ pub async fn start_tcp_server(
     tpu_addr: SocketAddr,
     bank_forks: Arc<RwLock<BankForks>>,
     block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+    connection_cache: Arc<ConnectionCache>,
 ) -> io::Result<()> {
     // Note: These settings are copied straight from the tarpc example.
     let server = tcp::listen(listen_addr, Bincode::default)
@@ -397,6 +419,7 @@ pub async fn start_tcp_server(
                 &bank_forks,
                 None,
                 receiver,
+                &connection_cache,
                 5_000,
                 0,
             );

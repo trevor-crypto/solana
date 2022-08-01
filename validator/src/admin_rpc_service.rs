@@ -10,8 +10,10 @@ use {
         consensus::Tower, tower_storage::TowerStorage, validator::ValidatorStartProgress,
     },
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
+    solana_runtime::bank_forks::BankForks,
     solana_sdk::{
         exit::Exit,
+        pubkey::Pubkey,
         signature::{read_keypair_file, Keypair, Signer},
     },
     std::{
@@ -25,16 +27,38 @@ use {
 };
 
 #[derive(Clone)]
+pub struct AdminRpcRequestMetadataPostInit {
+    pub cluster_info: Arc<ClusterInfo>,
+    pub bank_forks: Arc<RwLock<BankForks>>,
+    pub vote_account: Pubkey,
+}
+
+#[derive(Clone)]
 pub struct AdminRpcRequestMetadata {
     pub rpc_addr: Option<SocketAddr>,
     pub start_time: SystemTime,
     pub start_progress: Arc<RwLock<ValidatorStartProgress>>,
     pub validator_exit: Arc<RwLock<Exit>>,
     pub authorized_voter_keypairs: Arc<RwLock<Vec<Arc<Keypair>>>>,
-    pub cluster_info: Arc<RwLock<Option<Arc<ClusterInfo>>>>,
     pub tower_storage: Arc<dyn TowerStorage>,
+    pub post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
 }
 impl Metadata for AdminRpcRequestMetadata {}
+
+impl AdminRpcRequestMetadata {
+    fn with_post_init<F, R>(&self, func: F) -> Result<R>
+    where
+        F: FnOnce(&AdminRpcRequestMetadataPostInit) -> Result<R>,
+    {
+        if let Some(post_init) = self.post_init.read().unwrap().as_ref() {
+            func(post_init)
+        } else {
+            Err(jsonrpc_core::error::Error::invalid_params(
+                "Retry once validator start up is complete",
+            ))
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AdminRpcContactInfo {
@@ -128,11 +152,28 @@ pub trait AdminRpc {
     #[rpc(meta, name = "addAuthorizedVoter")]
     fn add_authorized_voter(&self, meta: Self::Metadata, keypair_file: String) -> Result<()>;
 
+    #[rpc(meta, name = "addAuthorizedVoterFromBytes")]
+    fn add_authorized_voter_from_bytes(&self, meta: Self::Metadata, keypair: Vec<u8>)
+        -> Result<()>;
+
     #[rpc(meta, name = "removeAllAuthorizedVoters")]
     fn remove_all_authorized_voters(&self, meta: Self::Metadata) -> Result<()>;
 
     #[rpc(meta, name = "setIdentity")]
-    fn set_identity(&self, meta: Self::Metadata, keypair_file: String) -> Result<()>;
+    fn set_identity(
+        &self,
+        meta: Self::Metadata,
+        keypair_file: String,
+        require_tower: bool,
+    ) -> Result<()>;
+
+    #[rpc(meta, name = "setIdentityFromBytes")]
+    fn set_identity_from_bytes(
+        &self,
+        meta: Self::Metadata,
+        identity_keypair: Vec<u8>,
+        require_tower: bool,
+    ) -> Result<()>;
 
     #[rpc(meta, name = "contactInfo")]
     fn contact_info(&self, meta: Self::Metadata) -> Result<AdminRpcContactInfo>;
@@ -191,6 +232,78 @@ impl AdminRpc for AdminRpcImpl {
         let authorized_voter = read_keypair_file(keypair_file)
             .map_err(|err| jsonrpc_core::error::Error::invalid_params(format!("{}", err)))?;
 
+        AdminRpcImpl::add_authorized_voter_keypair(meta, authorized_voter)
+    }
+
+    fn add_authorized_voter_from_bytes(
+        &self,
+        meta: Self::Metadata,
+        keypair: Vec<u8>,
+    ) -> Result<()> {
+        debug!("add_authorized_voter_from_bytes request received");
+
+        let authorized_voter = Keypair::from_bytes(&keypair).map_err(|err| {
+            jsonrpc_core::error::Error::invalid_params(format!(
+                "Failed to read authorized voter keypair from provided byte array: {}",
+                err
+            ))
+        })?;
+
+        AdminRpcImpl::add_authorized_voter_keypair(meta, authorized_voter)
+    }
+
+    fn remove_all_authorized_voters(&self, meta: Self::Metadata) -> Result<()> {
+        debug!("remove_all_authorized_voters received");
+        meta.authorized_voter_keypairs.write().unwrap().clear();
+        Ok(())
+    }
+
+    fn set_identity(
+        &self,
+        meta: Self::Metadata,
+        keypair_file: String,
+        require_tower: bool,
+    ) -> Result<()> {
+        debug!("set_identity request received");
+
+        let identity_keypair = read_keypair_file(&keypair_file).map_err(|err| {
+            jsonrpc_core::error::Error::invalid_params(format!(
+                "Failed to read identity keypair from {}: {}",
+                keypair_file, err
+            ))
+        })?;
+
+        AdminRpcImpl::set_identity_keypair(meta, identity_keypair, require_tower)
+    }
+
+    fn set_identity_from_bytes(
+        &self,
+        meta: Self::Metadata,
+        identity_keypair: Vec<u8>,
+        require_tower: bool,
+    ) -> Result<()> {
+        debug!("set_identity_from_bytes request received");
+
+        let identity_keypair = Keypair::from_bytes(&identity_keypair).map_err(|err| {
+            jsonrpc_core::error::Error::invalid_params(format!(
+                "Failed to read identity keypair from provided byte array: {}",
+                err
+            ))
+        })?;
+
+        AdminRpcImpl::set_identity_keypair(meta, identity_keypair, require_tower)
+    }
+
+    fn contact_info(&self, meta: Self::Metadata) -> Result<AdminRpcContactInfo> {
+        meta.with_post_init(|post_init| Ok(post_init.cluster_info.my_contact_info().into()))
+    }
+}
+
+impl AdminRpcImpl {
+    fn add_authorized_voter_keypair(
+        meta: AdminRpcRequestMetadata,
+        authorized_voter: Keypair,
+    ) -> Result<()> {
         let mut authorized_voter_keypairs = meta.authorized_voter_keypairs.write().unwrap();
 
         if authorized_voter_keypairs
@@ -206,51 +319,30 @@ impl AdminRpc for AdminRpcImpl {
         }
     }
 
-    fn remove_all_authorized_voters(&self, meta: Self::Metadata) -> Result<()> {
-        debug!("remove_all_authorized_voters received");
-        meta.authorized_voter_keypairs.write().unwrap().clear();
-        Ok(())
-    }
+    fn set_identity_keypair(
+        meta: AdminRpcRequestMetadata,
+        identity_keypair: Keypair,
+        require_tower: bool,
+    ) -> Result<()> {
+        meta.with_post_init(|post_init| {
+            if require_tower {
+                let _ = Tower::restore(meta.tower_storage.as_ref(), &identity_keypair.pubkey())
+                    .map_err(|err| {
+                        jsonrpc_core::error::Error::invalid_params(format!(
+                            "Unable to load tower file for identity {}: {}",
+                            identity_keypair.pubkey(),
+                            err
+                        ))
+                    })?;
+            }
 
-    fn set_identity(&self, meta: Self::Metadata, keypair_file: String) -> Result<()> {
-        debug!("set_identity request received");
-
-        let identity_keypair = read_keypair_file(&keypair_file).map_err(|err| {
-            jsonrpc_core::error::Error::invalid_params(format!(
-                "Failed to read identity keypair from {}: {}",
-                keypair_file, err
-            ))
-        })?;
-
-        // Ensure a Tower exists for the new identity and exit gracefully.
-        // ReplayStage will be less forgiving if it fails to load the new tower.
-        Tower::restore(meta.tower_storage.as_ref(), &identity_keypair.pubkey()).map_err(|err| {
-            jsonrpc_core::error::Error::invalid_params(format!(
-                "Unable to load tower file for new identity: {}",
-                err
-            ))
-        })?;
-
-        if let Some(cluster_info) = meta.cluster_info.read().unwrap().as_ref() {
             solana_metrics::set_host_id(identity_keypair.pubkey().to_string());
-            cluster_info.set_keypair(Arc::new(identity_keypair));
-            warn!("Identity set to {}", cluster_info.id());
+            post_init
+                .cluster_info
+                .set_keypair(Arc::new(identity_keypair));
+            warn!("Identity set to {}", post_init.cluster_info.id());
             Ok(())
-        } else {
-            Err(jsonrpc_core::error::Error::invalid_params(
-                "Retry once validator start up is complete",
-            ))
-        }
-    }
-
-    fn contact_info(&self, meta: Self::Metadata) -> Result<AdminRpcContactInfo> {
-        if let Some(cluster_info) = meta.cluster_info.read().unwrap().as_ref() {
-            Ok(cluster_info.my_contact_info().into())
-        } else {
-            Err(jsonrpc_core::error::Error::invalid_params(
-                "Retry once validator start up is complete",
-            ))
-        }
+        })
     }
 }
 
@@ -260,6 +352,7 @@ pub fn run(ledger_path: &Path, metadata: AdminRpcRequestMetadata) {
 
     let event_loop = tokio::runtime::Builder::new_multi_thread()
         .thread_name("sol-adminrpc-el")
+        .worker_threads(3) // Three still seems like a lot, and better than the default of available core count
         .enable_all()
         .build()
         .unwrap();

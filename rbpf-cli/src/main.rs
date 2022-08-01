@@ -1,5 +1,5 @@
 use {
-    clap::{crate_version, App, Arg},
+    clap::{crate_version, Arg, Command},
     serde::{Deserialize, Serialize},
     serde_json::Result,
     solana_bpf_loader_program::{
@@ -11,19 +11,20 @@ use {
         assembler::assemble,
         elf::Executable,
         static_analysis::Analysis,
-        verifier::check,
-        vm::{Config, DynamicAnalysis},
+        verifier::RequisiteVerifier,
+        vm::{Config, DynamicAnalysis, VerifiedExecutable},
     },
     solana_sdk::{
         account::AccountSharedData, bpf_loader, instruction::AccountMeta, pubkey::Pubkey,
-        transaction_context::TransactionContext,
+        sysvar::rent::Rent, transaction_context::TransactionContext,
     },
     std::{
+        fmt::{Debug, Formatter},
         fs::File,
         io::{Read, Seek, SeekFrom},
         path::Path,
+        time::{Duration, Instant},
     },
-    time::Instant,
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -43,16 +44,16 @@ struct Input {
 fn load_accounts(path: &Path) -> Result<Input> {
     let file = File::open(path).unwrap();
     let input: Input = serde_json::from_reader(file)?;
-    println!("Program input:");
-    println!("accounts {:?}", &input.accounts);
-    println!("instruction_data {:?}", &input.instruction_data);
-    println!("----------------------------------------");
+    eprintln!("Program input:");
+    eprintln!("accounts {:?}", &input.accounts);
+    eprintln!("instruction_data {:?}", &input.instruction_data);
+    eprintln!("----------------------------------------");
     Ok(input)
 }
 
 fn main() {
     solana_logger::setup();
-    let matches = App::new("Solana BPF CLI")
+    let matches = Command::new("Solana BPF CLI")
         .version(crate_version!())
         .author("Solana Maintainers <maintainers@solana.foundation>")
         .about(
@@ -87,7 +88,7 @@ and the following fields are required
         )
         .arg(
             Arg::new("PROGRAM")
-                .about(
+                .help(
                     "Program file to use. This is either an ELF shared-object file to be executed, \
                      or an assembly file to be assembled and executed.",
                 )
@@ -96,7 +97,7 @@ and the following fields are required
         )
         .arg(
             Arg::new("input")
-                .about(
+                .help(
                     "Input for the program to run on, where FILE is a name of a JSON file \
 with input data, or BYTES is the number of 0-valued bytes to allocate for program parameters",
                 )
@@ -108,7 +109,7 @@ with input data, or BYTES is the number of 0-valued bytes to allocate for progra
         )
         .arg(
             Arg::new("memory")
-                .about("Heap memory for the program to run on")
+                .help("Heap memory for the program to run on")
                 .short('m')
                 .long("memory")
                 .value_name("BYTES")
@@ -117,7 +118,7 @@ with input data, or BYTES is the number of 0-valued bytes to allocate for progra
         )
         .arg(
             Arg::new("use")
-                .about(
+                .help(
                     "Method of execution to use, where 'cfg' generates Control Flow Graph \
 of the program, 'disassembler' dumps disassembled code of the program, 'interpreter' runs \
 the program in the virtual machine's interpreter, and 'jit' precompiles the program to \
@@ -132,7 +133,7 @@ native machine code before execting it in the virtual machine.",
         )
         .arg(
             Arg::new("instruction limit")
-                .about("Limit the number of instructions to execute")
+                .help("Limit the number of instructions to execute")
                 .short('l')
                 .long("limit")
                 .takes_value(true)
@@ -141,21 +142,24 @@ native machine code before execting it in the virtual machine.",
         )
         .arg(
             Arg::new("trace")
-                .about("Output trace to 'trace.out' file using tracing instrumentation")
+                .help("Output trace to 'trace.out' file using tracing instrumentation")
                 .short('t')
                 .long("trace"),
         )
         .arg(
             Arg::new("profile")
-                .about("Output profile to 'profile.dot' file using tracing instrumentation")
+                .help("Output profile to 'profile.dot' file using tracing instrumentation")
                 .short('p')
                 .long("profile"),
         )
         .arg(
-            Arg::new("verify")
-                .about("Run the verifier before execution or disassembly")
-                .short('v')
-                .long("verify"),
+            Arg::new("output_format")
+                .help("Return information in specified output format")
+                .long("output")
+                .value_name("FORMAT")
+                .global(true)
+                .takes_value(true)
+                .possible_values(&["json", "json-compact"]),
         )
         .get_matches();
 
@@ -212,7 +216,12 @@ native machine code before execting it in the virtual machine.",
     let program_indices = [0, 1];
     let preparation =
         prepare_mock_invoke_context(transaction_accounts, instruction_accounts, &program_indices);
-    let mut transaction_context = TransactionContext::new(preparation.transaction_accounts, 1, 1);
+    let mut transaction_context = TransactionContext::new(
+        preparation.transaction_accounts,
+        Some(Rent::default()),
+        1,
+        1,
+    );
     let mut invoke_context = InvokeContext::new_mock(&mut transaction_context, &[]);
     invoke_context
         .push(
@@ -227,6 +236,7 @@ native machine code before execting it in the virtual machine.",
             .transaction_context
             .get_current_instruction_context()
             .unwrap(),
+        true, // should_cap_ix_accounts
     )
     .unwrap();
     let compute_meter = invoke_context.get_compute_meter();
@@ -239,54 +249,53 @@ native machine code before execting it in the virtual machine.",
     file.seek(SeekFrom::Start(0)).unwrap();
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).unwrap();
-    let syscall_registry = register_syscalls(&mut invoke_context).unwrap();
-    let mut executable = if magic == [0x7f, 0x45, 0x4c, 0x46] {
-        Executable::<BpfError, ThisInstructionMeter>::from_elf(
-            &contents,
-            None,
-            config,
-            syscall_registry,
-        )
-        .map_err(|err| format!("Executable constructor failed: {:?}", err))
+    let syscall_registry = register_syscalls(&mut invoke_context, true).unwrap();
+    let executable = if magic == [0x7f, 0x45, 0x4c, 0x46] {
+        Executable::<BpfError, ThisInstructionMeter>::from_elf(&contents, config, syscall_registry)
+            .map_err(|err| format!("Executable constructor failed: {:?}", err))
     } else {
         assemble::<BpfError, ThisInstructionMeter>(
             std::str::from_utf8(contents.as_slice()).unwrap(),
-            None,
             config,
             syscall_registry,
         )
     }
     .unwrap();
 
-    if matches.is_present("verify") {
-        let text_bytes = executable.get_text_bytes().1;
-        check(text_bytes, &config).unwrap();
-    }
-    Executable::<BpfError, ThisInstructionMeter>::jit_compile(&mut executable).unwrap();
-    let analysis = Analysis::from_executable(&executable);
+    let mut verified_executable =
+        VerifiedExecutable::<RequisiteVerifier, BpfError, ThisInstructionMeter>::from_executable(
+            executable,
+        )
+        .map_err(|err| format!("Executable verifier failed: {:?}", err))
+        .unwrap();
+
+    verified_executable.jit_compile().unwrap();
+    let mut analysis = LazyAnalysis::new(verified_executable.get_executable());
 
     match matches.value_of("use") {
         Some("cfg") => {
             let mut file = File::create("cfg.dot").unwrap();
-            analysis.visualize_graphically(&mut file, None).unwrap();
+            analysis
+                .analyze()
+                .visualize_graphically(&mut file, None)
+                .unwrap();
             return;
         }
         Some("disassembler") => {
             let stdout = std::io::stdout();
-            analysis.disassemble(&mut stdout.lock()).unwrap();
+            analysis.analyze().disassemble(&mut stdout.lock()).unwrap();
             return;
         }
         _ => {}
     }
 
     let mut vm = create_vm(
-        &executable,
+        &verified_executable,
         parameter_bytes.as_slice_mut(),
+        account_lengths,
         &mut invoke_context,
-        &account_lengths,
     )
     .unwrap();
-    println!("Program output:");
     let start_time = Instant::now();
     let result = if matches.value_of("use").unwrap() == "interpreter" {
         vm.execute_program_interpreted(&mut instruction_meter)
@@ -294,22 +303,93 @@ native machine code before execting it in the virtual machine.",
         vm.execute_program_jit(&mut instruction_meter)
     };
     let duration = Instant::now() - start_time;
-    println!("Result: {:?}", result);
-    println!("Instruction Count: {}", vm.get_total_instruction_count());
-    println!("Execution time: {} us", duration.whole_microseconds());
+
     if matches.is_present("trace") {
-        println!("Trace is saved in trace.out");
+        eprintln!("Trace is saved in trace.out");
         let mut file = File::create("trace.out").unwrap();
-        let analysis = Analysis::from_executable(&executable);
-        vm.get_tracer().write(&mut file, &analysis).unwrap();
+        vm.get_tracer()
+            .write(&mut file, analysis.analyze())
+            .unwrap();
     }
     if matches.is_present("profile") {
-        println!("Profile is saved in profile.dot");
+        eprintln!("Profile is saved in profile.dot");
         let tracer = &vm.get_tracer();
-        let dynamic_analysis = DynamicAnalysis::new(tracer, &analysis);
+        let analysis = analysis.analyze();
+        let dynamic_analysis = DynamicAnalysis::new(tracer, analysis);
         let mut file = File::create("profile.dot").unwrap();
         analysis
             .visualize_graphically(&mut file, Some(&dynamic_analysis))
             .unwrap();
+    }
+
+    let instruction_count = vm.get_total_instruction_count();
+    drop(vm);
+
+    let output = Output {
+        result: format!("{:?}", result),
+        instruction_count,
+        execution_time: duration,
+        log: invoke_context
+            .get_log_collector()
+            .unwrap()
+            .borrow()
+            .get_recorded_content()
+            .to_vec(),
+    };
+    match matches.value_of("output_format") {
+        Some("json") => {
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        Some("json-compact") => {
+            println!("{}", serde_json::to_string(&output).unwrap());
+        }
+        _ => {
+            println!("Program output:");
+            println!("{:?}", output);
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct Output {
+    result: String,
+    instruction_count: u64,
+    execution_time: Duration,
+    log: Vec<String>,
+}
+
+impl Debug for Output {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Result: {}", self.result)?;
+        writeln!(f, "Instruction Count: {}", self.instruction_count)?;
+        writeln!(f, "Execution time: {} us", self.execution_time.as_micros())?;
+        for line in &self.log {
+            writeln!(f, "{}", line)?;
+        }
+        Ok(())
+    }
+}
+
+// Replace with std::lazy::Lazy when stabilized.
+// https://github.com/rust-lang/rust/issues/74465
+struct LazyAnalysis<'a> {
+    analysis: Option<Analysis<'a, BpfError, ThisInstructionMeter>>,
+    executable: &'a Executable<BpfError, ThisInstructionMeter>,
+}
+
+impl<'a> LazyAnalysis<'a> {
+    fn new(executable: &'a Executable<BpfError, ThisInstructionMeter>) -> Self {
+        Self {
+            analysis: None,
+            executable,
+        }
+    }
+
+    fn analyze(&mut self) -> &Analysis<BpfError, ThisInstructionMeter> {
+        if let Some(ref analysis) = self.analysis {
+            return analysis;
+        }
+        self.analysis
+            .insert(Analysis::from_executable(self.executable).unwrap())
     }
 }

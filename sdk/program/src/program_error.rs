@@ -1,3 +1,5 @@
+//! The [`ProgramError`] type and related definitions.
+
 #![allow(clippy::integer_arithmetic)]
 use {
     crate::{decode_error::DecodeError, instruction::InstructionError, msg, pubkey::PubkeyError},
@@ -49,8 +51,10 @@ pub enum ProgramError {
     UnsupportedSysvar,
     #[error("Provided owner is not allowed")]
     IllegalOwner,
-    #[error("Requested account data allocation exceeded the accounts data budget")]
-    AccountsDataBudgetExceeded,
+    #[error("Account data allocation exceeded the maximum accounts data size limit")]
+    MaxAccountsDataSizeExceeded,
+    #[error("Account data reallocation was invalid")]
+    InvalidRealloc,
 }
 
 pub trait PrintProgramError {
@@ -89,7 +93,8 @@ impl PrintProgramError for ProgramError {
             Self::AccountNotRentExempt => msg!("Error: AccountNotRentExempt"),
             Self::UnsupportedSysvar => msg!("Error: UnsupportedSysvar"),
             Self::IllegalOwner => msg!("Error: IllegalOwner"),
-            Self::AccountsDataBudgetExceeded => msg!("Error: AccountsDataBudgetExceeded"),
+            Self::MaxAccountsDataSizeExceeded => msg!("Error: MaxAccountsDataSizeExceeded"),
+            Self::InvalidRealloc => msg!("Error: InvalidRealloc"),
         }
     }
 }
@@ -120,10 +125,11 @@ pub const BORSH_IO_ERROR: u64 = to_builtin!(15);
 pub const ACCOUNT_NOT_RENT_EXEMPT: u64 = to_builtin!(16);
 pub const UNSUPPORTED_SYSVAR: u64 = to_builtin!(17);
 pub const ILLEGAL_OWNER: u64 = to_builtin!(18);
-pub const ACCOUNTS_DATA_BUDGET_EXCEEDED: u64 = to_builtin!(19);
+pub const MAX_ACCOUNTS_DATA_SIZE_EXCEEDED: u64 = to_builtin!(19);
+pub const INVALID_ACCOUNT_DATA_REALLOC: u64 = to_builtin!(20);
 // Warning: Any new program errors added here must also be:
 // - Added to the below conversions
-// - Added as an equivilent to InstructionError
+// - Added as an equivalent to InstructionError
 // - Be featureized in the BPF loader to return `InstructionError::InvalidError`
 //   until the feature is activated
 
@@ -147,7 +153,8 @@ impl From<ProgramError> for u64 {
             ProgramError::AccountNotRentExempt => ACCOUNT_NOT_RENT_EXEMPT,
             ProgramError::UnsupportedSysvar => UNSUPPORTED_SYSVAR,
             ProgramError::IllegalOwner => ILLEGAL_OWNER,
-            ProgramError::AccountsDataBudgetExceeded => ACCOUNTS_DATA_BUDGET_EXCEEDED,
+            ProgramError::MaxAccountsDataSizeExceeded => MAX_ACCOUNTS_DATA_SIZE_EXCEEDED,
+            ProgramError::InvalidRealloc => INVALID_ACCOUNT_DATA_REALLOC,
             ProgramError::Custom(error) => {
                 if error == 0 {
                     CUSTOM_ZERO
@@ -180,7 +187,8 @@ impl From<u64> for ProgramError {
             ACCOUNT_NOT_RENT_EXEMPT => Self::AccountNotRentExempt,
             UNSUPPORTED_SYSVAR => Self::UnsupportedSysvar,
             ILLEGAL_OWNER => Self::IllegalOwner,
-            ACCOUNTS_DATA_BUDGET_EXCEEDED => Self::AccountsDataBudgetExceeded,
+            MAX_ACCOUNTS_DATA_SIZE_EXCEEDED => Self::MaxAccountsDataSizeExceeded,
+            INVALID_ACCOUNT_DATA_REALLOC => Self::InvalidRealloc,
             _ => Self::Custom(error as u32),
         }
     }
@@ -209,7 +217,8 @@ impl TryFrom<InstructionError> for ProgramError {
             Self::Error::AccountNotRentExempt => Ok(Self::AccountNotRentExempt),
             Self::Error::UnsupportedSysvar => Ok(Self::UnsupportedSysvar),
             Self::Error::IllegalOwner => Ok(Self::IllegalOwner),
-            Self::Error::AccountsDataBudgetExceeded => Ok(Self::AccountsDataBudgetExceeded),
+            Self::Error::MaxAccountsDataSizeExceeded => Ok(Self::MaxAccountsDataSizeExceeded),
+            Self::Error::InvalidRealloc => Ok(Self::InvalidRealloc),
             _ => Err(error),
         }
     }
@@ -240,7 +249,8 @@ where
             ACCOUNT_NOT_RENT_EXEMPT => Self::AccountNotRentExempt,
             UNSUPPORTED_SYSVAR => Self::UnsupportedSysvar,
             ILLEGAL_OWNER => Self::IllegalOwner,
-            ACCOUNTS_DATA_BUDGET_EXCEEDED => Self::AccountsDataBudgetExceeded,
+            MAX_ACCOUNTS_DATA_SIZE_EXCEEDED => Self::MaxAccountsDataSizeExceeded,
+            INVALID_ACCOUNT_DATA_REALLOC => Self::InvalidRealloc,
             _ => {
                 // A valid custom error has no bits set in the upper 32
                 if error >> BUILTIN_BIT_SHIFT == 0 {

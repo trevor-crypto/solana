@@ -167,7 +167,7 @@ impl AggregateCommitmentService {
         );
         new_block_commitment.set_highest_confirmed_root(highest_confirmed_root);
 
-        std::mem::swap(&mut *w_block_commitment_cache, &mut new_block_commitment);
+        *w_block_commitment_cache = new_block_commitment;
         w_block_commitment_cache.commitment_slots()
     }
 
@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn test_highest_confirmed_root_advance() {
         fn get_vote_account_root_slot(vote_pubkey: Pubkey, bank: &Arc<Bank>) -> Slot {
-            let (_stake, vote_account) = bank.get_vote_account(&vote_pubkey).unwrap();
+            let vote_account = bank.get_vote_account(&vote_pubkey).unwrap();
             let slot = vote_account
                 .vote_state()
                 .as_ref()
@@ -516,7 +516,7 @@ mod tests {
         // Create enough banks such that vote account will root slots 0 and 1
         for x in 0..33 {
             let previous_bank = bank_forks.get(x).unwrap();
-            let bank = Bank::new_from_parent(previous_bank, &Pubkey::default(), x + 1);
+            let bank = Bank::new_from_parent(&previous_bank, &Pubkey::default(), x + 1);
             let vote = vote_transaction::new_vote_transaction(
                 vec![x],
                 previous_bank.hash(),
@@ -541,7 +541,7 @@ mod tests {
 
         // Add an additional bank/vote that will root slot 2
         let bank33 = bank_forks.get(33).unwrap();
-        let bank34 = Bank::new_from_parent(bank33, &Pubkey::default(), 34);
+        let bank34 = Bank::new_from_parent(&bank33, &Pubkey::default(), 34);
         let vote33 = vote_transaction::new_vote_transaction(
             vec![33],
             bank33.hash(),
@@ -584,7 +584,7 @@ mod tests {
         // Add a forked bank. Because the vote for bank 33 landed in the non-ancestor, the vote
         // account's root (and thus the highest_confirmed_root) rolls back to slot 1
         let bank33 = bank_forks.get(33).unwrap();
-        let bank35 = Bank::new_from_parent(bank33, &Pubkey::default(), 35);
+        let bank35 = Bank::new_from_parent(&bank33, &Pubkey::default(), 35);
         bank_forks.insert(bank35);
 
         let working_bank = bank_forks.working_bank();
@@ -609,7 +609,7 @@ mod tests {
         // continues normally
         for x in 35..=37 {
             let previous_bank = bank_forks.get(x).unwrap();
-            let bank = Bank::new_from_parent(previous_bank, &Pubkey::default(), x + 1);
+            let bank = Bank::new_from_parent(&previous_bank, &Pubkey::default(), x + 1);
             let vote = vote_transaction::new_vote_transaction(
                 vec![x],
                 previous_bank.hash(),

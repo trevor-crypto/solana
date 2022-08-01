@@ -5,9 +5,11 @@
 //! but they are undocumented, may change over time, and are generally more
 //! cumbersome to use.
 
-pub use solana_banks_interface::{BanksClient as TarpcClient, TransactionStatus};
-use {
+pub use {
     crate::error::BanksClientError,
+    solana_banks_interface::{BanksClient as TarpcClient, TransactionStatus},
+};
+use {
     borsh::BorshDeserialize,
     futures::{future::join_all, Future, FutureExt, TryFutureExt},
     solana_banks_interface::{BanksRequest, BanksResponse, BanksTransactionResultWithSimulation},
@@ -136,6 +138,18 @@ impl BanksClient {
             .map_err(Into::into)
     }
 
+    pub fn simulate_transaction_with_commitment_and_context(
+        &mut self,
+        ctx: Context,
+        transaction: Transaction,
+        commitment: CommitmentLevel,
+    ) -> impl Future<Output = Result<BanksTransactionResultWithSimulation, BanksClientError>> + '_
+    {
+        self.inner
+            .simulate_transaction_with_commitment_and_context(ctx, transaction, commitment)
+            .map_err(Into::into)
+    }
+
     pub fn get_account_with_commitment_and_context(
         &mut self,
         ctx: Context,
@@ -245,6 +259,7 @@ impl BanksClient {
                 err,
                 logs: simulation_details.logs,
                 units_consumed: simulation_details.units_consumed,
+                return_data: simulation_details.return_data,
             }),
             BanksTransactionResultWithSimulation {
                 result: Some(result),
@@ -295,6 +310,29 @@ impl BanksClient {
         transactions: Vec<Transaction>,
     ) -> impl Future<Output = Result<(), BanksClientError>> + '_ {
         self.process_transactions_with_commitment(transactions, CommitmentLevel::default())
+    }
+
+    /// Simulate a transaction at the given commitment level
+    pub fn simulate_transaction_with_commitment(
+        &mut self,
+        transaction: Transaction,
+        commitment: CommitmentLevel,
+    ) -> impl Future<Output = Result<BanksTransactionResultWithSimulation, BanksClientError>> + '_
+    {
+        self.simulate_transaction_with_commitment_and_context(
+            context::current(),
+            transaction,
+            commitment,
+        )
+    }
+
+    /// Simulate a transaction at the default commitment level
+    pub fn simulate_transaction(
+        &mut self,
+        transaction: Transaction,
+    ) -> impl Future<Output = Result<BanksTransactionResultWithSimulation, BanksClientError>> + '_
+    {
+        self.simulate_transaction_with_commitment(transaction, CommitmentLevel::default())
     }
 
     /// Return the most recent rooted slot. All transactions at or below this slot
@@ -513,6 +551,11 @@ mod tests {
 
             let recent_blockhash = banks_client.get_latest_blockhash().await?;
             let transaction = Transaction::new(&[&genesis.mint_keypair], message, recent_blockhash);
+            let simulation_result = banks_client
+                .simulate_transaction(transaction.clone())
+                .await
+                .unwrap();
+            assert!(simulation_result.result.unwrap().is_ok());
             banks_client.process_transaction(transaction).await.unwrap();
             assert_eq!(banks_client.get_balance(bob_pubkey).await?, 1);
             Ok(())

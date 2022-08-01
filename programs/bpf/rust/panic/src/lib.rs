@@ -1,6 +1,6 @@
 //! Example Rust-based BPF program that panics
 
-#[cfg(all(feature = "custom-panic", target_arch = "bpf"))]
+#[cfg(all(feature = "custom-panic", target_os = "solana"))]
 #[no_mangle]
 fn custom_panic(info: &core::panic::PanicInfo<'_>) {
     // Note: Full panic reporting is included here for testing purposes
@@ -9,11 +9,9 @@ fn custom_panic(info: &core::panic::PanicInfo<'_>) {
 }
 
 extern crate solana_program;
-use solana_program::{
-    account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey,
-};
+use solana_program::{account_info::AccountInfo, entrypoint::ProgramResult, pubkey::Pubkey};
 
-entrypoint!(process_instruction);
+solana_program::entrypoint!(process_instruction);
 #[allow(clippy::unnecessary_wraps)]
 fn process_instruction(
     _program_id: &Pubkey,

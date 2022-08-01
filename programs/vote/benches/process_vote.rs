@@ -3,48 +3,39 @@
 extern crate test;
 
 use {
-    solana_program_runtime::{invoke_context::InvokeContext, sysvar_cache::SysvarCache},
+    solana_program_runtime::invoke_context::InvokeContext,
     solana_sdk::{
         account::{create_account_for_test, Account, AccountSharedData},
         clock::{Clock, Slot},
-        feature_set::FeatureSet,
         hash::Hash,
-        instruction::{AccountMeta, Instruction},
         pubkey::Pubkey,
         slot_hashes::{SlotHashes, MAX_ENTRIES},
         sysvar,
-        transaction_context::{InstructionAccount, TransactionContext},
+        transaction_context::{InstructionAccount, TransactionAccount, TransactionContext},
     },
     solana_vote_program::{
         vote_instruction::VoteInstruction,
-        vote_state::{Vote, VoteInit, VoteState, VoteStateVersions, MAX_LOCKOUT_HISTORY},
+        vote_state::{
+            Vote, VoteInit, VoteState, VoteStateUpdate, VoteStateVersions, MAX_LOCKOUT_HISTORY,
+        },
     },
-    std::sync::Arc,
     test::Bencher,
 };
 
-/// `feature` can be used to change vote program behavior per bench run.
-fn do_bench(bencher: &mut Bencher, feature: Option<Pubkey>) {
+fn create_accounts() -> (
+    Slot,
+    SlotHashes,
+    Vec<TransactionAccount>,
+    Vec<InstructionAccount>,
+) {
     // vote accounts are usually almost full of votes in normal operation
-    let num_initial_votes = MAX_LOCKOUT_HISTORY;
-    let num_vote_slots: usize = 4;
-    let last_vote_slot = num_initial_votes
-        .saturating_add(num_vote_slots)
-        .saturating_sub(1);
-    let last_vote_hash = Hash::new_unique();
+    let num_initial_votes = MAX_LOCKOUT_HISTORY as Slot;
 
     let clock = Clock::default();
     let mut slot_hashes = SlotHashes::new(&[]);
     for i in 0..MAX_ENTRIES {
         // slot hashes is full in normal operation
-        slot_hashes.add(
-            i as Slot,
-            if i == last_vote_slot {
-                last_vote_hash
-            } else {
-                Hash::default()
-            },
-        );
+        slot_hashes.add(i as Slot, Hash::new_unique());
     }
 
     let vote_pubkey = Pubkey::new_unique();
@@ -60,10 +51,9 @@ fn do_bench(bencher: &mut Bencher, feature: Option<Pubkey>) {
             &clock,
         );
 
-        for next_vote_slot in 0..num_initial_votes as u64 {
+        for next_vote_slot in 0..num_initial_votes {
             vote_state.process_next_vote_slot(next_vote_slot, 0);
         }
-
         let mut vote_account_data: Vec<u8> = vec![0; VoteState::size_of()];
         let versioned = VoteStateVersions::new_current(vote_state);
         VoteState::serialize(&versioned, &mut vote_account_data).unwrap();
@@ -76,95 +66,119 @@ fn do_bench(bencher: &mut Bencher, feature: Option<Pubkey>) {
             rent_epoch: 0,
         }
     };
-    let slot_hashes_account = create_account_for_test(&slot_hashes);
-    let clock_account = create_account_for_test(&clock);
-    let authority_account = Account::default();
 
-    let mut sysvar_cache = SysvarCache::default();
-    sysvar_cache.set_clock(clock);
-    sysvar_cache.set_slot_hashes(slot_hashes);
-
-    let mut feature_set = FeatureSet::all_enabled();
-    if let Some(feature) = feature {
-        feature_set.activate(&feature, 0);
-    }
-    let feature_set = Arc::new(feature_set);
-
-    let vote_ix_data = bincode::serialize(&VoteInstruction::Vote(Vote::new(
-        (num_initial_votes as u64..).take(num_vote_slots).collect(),
-        last_vote_hash,
-    )))
-    .unwrap();
-
-    let instruction = Instruction {
-        program_id: solana_vote_program::id(),
-        data: vote_ix_data,
-        accounts: vec![
-            AccountMeta::new(vote_pubkey, false),
-            AccountMeta::new_readonly(sysvar::slot_hashes::id(), false),
-            AccountMeta::new_readonly(sysvar::clock::id(), false),
-            AccountMeta::new_readonly(authority_pubkey, true),
-        ],
-    };
-
-    let program_indices = vec![4];
-    let instruction_accounts = instruction
-        .accounts
-        .iter()
-        .enumerate()
-        .map(|(index_in_transaction, account_meta)| InstructionAccount {
-            index_in_transaction,
-            index_in_caller: index_in_transaction,
-            is_signer: account_meta.is_signer,
-            is_writable: account_meta.is_writable,
+    let transaction_accounts = vec![
+        (solana_vote_program::id(), AccountSharedData::default()),
+        (vote_pubkey, AccountSharedData::from(vote_account)),
+        (
+            sysvar::slot_hashes::id(),
+            AccountSharedData::from(create_account_for_test(&slot_hashes)),
+        ),
+        (
+            sysvar::clock::id(),
+            AccountSharedData::from(create_account_for_test(&clock)),
+        ),
+        (authority_pubkey, AccountSharedData::default()),
+    ];
+    let mut instruction_accounts = (0..4)
+        .map(|index_in_callee| InstructionAccount {
+            index_in_transaction: 1usize.saturating_add(index_in_callee),
+            index_in_caller: index_in_callee,
+            index_in_callee,
+            is_signer: false,
+            is_writable: false,
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<InstructionAccount>>();
+    instruction_accounts[0].is_writable = true;
+    instruction_accounts[3].is_signer = true;
 
+    (
+        num_initial_votes,
+        slot_hashes,
+        transaction_accounts,
+        instruction_accounts,
+    )
+}
+
+fn bench_process_vote_instruction(
+    bencher: &mut Bencher,
+    transaction_accounts: Vec<TransactionAccount>,
+    instruction_accounts: Vec<InstructionAccount>,
+    instruction_data: Vec<u8>,
+) {
     bencher.iter(|| {
         let mut transaction_context = TransactionContext::new(
-            vec![
-                (vote_pubkey, AccountSharedData::from(vote_account.clone())),
-                (
-                    sysvar::slot_hashes::id(),
-                    AccountSharedData::from(slot_hashes_account.clone()),
-                ),
-                (
-                    sysvar::clock::id(),
-                    AccountSharedData::from(clock_account.clone()),
-                ),
-                (
-                    authority_pubkey,
-                    AccountSharedData::from(authority_account.clone()),
-                ),
-                (solana_vote_program::id(), AccountSharedData::default()),
-            ],
+            transaction_accounts.clone(),
+            Some(sysvar::rent::Rent::default()),
             1,
             1,
         );
-
-        let mut invoke_context = InvokeContext::new_mock_with_sysvars_and_features(
-            &mut transaction_context,
-            &sysvar_cache,
-            feature_set.clone(),
-        );
-
+        let mut invoke_context = InvokeContext::new_mock(&mut transaction_context, &[]);
         invoke_context
-            .push(&instruction_accounts, &program_indices, &[])
+            .push(&instruction_accounts, &[0], &instruction_data)
             .unwrap();
-
-        let first_instruction_account = 1;
-        assert_eq!(
-            solana_vote_program::vote_processor::process_instruction(
-                first_instruction_account,
-                &instruction.data,
-                &mut invoke_context
-            ),
-            Ok(())
+        assert!(
+            solana_vote_program::vote_processor::process_instruction(1, &mut invoke_context)
+                .is_ok()
         );
+        invoke_context.pop().unwrap();
     });
 }
 
 #[bench]
-fn bench_process_vote_instruction(bencher: &mut Bencher) {
-    do_bench(bencher, None);
+fn bench_process_vote(bencher: &mut Bencher) {
+    let (num_initial_votes, slot_hashes, transaction_accounts, instruction_accounts) =
+        create_accounts();
+
+    let num_vote_slots = 4;
+    let last_vote_slot = num_initial_votes
+        .saturating_add(num_vote_slots)
+        .saturating_sub(1);
+    let last_vote_hash = slot_hashes
+        .iter()
+        .find(|(slot, _hash)| *slot == last_vote_slot)
+        .unwrap()
+        .1;
+    let vote = Vote::new(
+        (num_initial_votes..=last_vote_slot).collect(),
+        last_vote_hash,
+    );
+    let instruction_data = bincode::serialize(&VoteInstruction::Vote(vote)).unwrap();
+
+    bench_process_vote_instruction(
+        bencher,
+        transaction_accounts,
+        instruction_accounts,
+        instruction_data,
+    );
+}
+
+#[bench]
+fn bench_process_vote_state_update(bencher: &mut Bencher) {
+    let (num_initial_votes, slot_hashes, transaction_accounts, instruction_accounts) =
+        create_accounts();
+
+    let num_vote_slots = MAX_LOCKOUT_HISTORY as Slot;
+    let last_vote_slot = num_initial_votes
+        .saturating_add(num_vote_slots)
+        .saturating_sub(1);
+    let last_vote_hash = slot_hashes
+        .iter()
+        .find(|(slot, _hash)| *slot == last_vote_slot)
+        .unwrap()
+        .1;
+    let slots_and_lockouts: Vec<(Slot, u32)> =
+        ((num_initial_votes.saturating_add(1)..=last_vote_slot).zip((1u32..=31).rev())).collect();
+    let mut vote_state_update = VoteStateUpdate::from(slots_and_lockouts);
+    vote_state_update.root = Some(num_initial_votes);
+    vote_state_update.hash = last_vote_hash;
+    let instruction_data =
+        bincode::serialize(&VoteInstruction::UpdateVoteState(vote_state_update)).unwrap();
+
+    bench_process_vote_instruction(
+        bencher,
+        transaction_accounts,
+        instruction_accounts,
+        instruction_data,
+    );
 }

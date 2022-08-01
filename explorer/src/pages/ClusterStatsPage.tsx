@@ -9,7 +9,7 @@ import {
 } from "providers/stats/solanaClusterStats";
 import { abbreviatedNumber, lamportsToSol, slotsToHumanString } from "utils";
 import { ClusterStatus, useCluster } from "providers/cluster";
-import { TpsCard } from "components/TpsCard";
+import { LiveTransactionStatsCard } from "components/LiveTransactionStatsCard";
 import { displayTimestampWithoutDate } from "utils/date";
 import { Status, useFetchSupply, useSupply } from "providers/supply";
 import { ErrorCard } from "components/common/ErrorCard";
@@ -35,7 +35,7 @@ export function ClusterStatsPage() {
         </div>
         <StatsCardBody />
       </div>
-      <TpsCard />
+      <LiveTransactionStatsCard />
     </div>
   );
 }

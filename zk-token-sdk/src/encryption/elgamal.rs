@@ -15,7 +15,7 @@
 
 use {
     crate::encryption::{
-        discrete_log::{DecodeU32Precomputation, DiscreteLog},
+        discrete_log::DiscreteLog,
         pedersen::{Pedersen, PedersenCommitment, PedersenOpening, G, H},
     },
     arrayref::{array_ref, array_refs},
@@ -23,6 +23,7 @@ use {
     curve25519_dalek::{
         ristretto::{CompressedRistretto, RistrettoPoint},
         scalar::Scalar,
+        traits::Identity,
     },
     serde::{Deserialize, Serialize},
     solana_sdk::{
@@ -36,7 +37,7 @@ use {
     subtle::{Choice, ConstantTimeEq},
     zeroize::Zeroize,
 };
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(not(target_os = "solana"))]
 use {
     rand::rngs::OsRng,
     sha3::Sha3_512,
@@ -49,12 +50,12 @@ use {
 };
 
 /// Algorithm handle for the twisted ElGamal encryption scheme
-struct ElGamal;
+pub struct ElGamal;
 impl ElGamal {
     /// Generates an ElGamal keypair.
     ///
     /// This function is randomized. It internally samples a scalar element using `OsRng`.
-    #[cfg(not(target_arch = "bpf"))]
+    #[cfg(not(target_os = "solana"))]
     #[allow(non_snake_case)]
     fn keygen() -> ElGamalKeypair {
         // secret scalar should be zero with negligible probability
@@ -66,7 +67,7 @@ impl ElGamal {
     }
 
     /// Generates an ElGamal keypair from a scalar input that determines the ElGamal private key.
-    #[cfg(not(target_arch = "bpf"))]
+    #[cfg(not(target_os = "solana"))]
     #[allow(non_snake_case)]
     fn keygen_with_scalar(s: &Scalar) -> ElGamalKeypair {
         assert!(s != &Scalar::zero());
@@ -83,7 +84,7 @@ impl ElGamal {
     /// corresponding ElGamal ciphertext.
     ///
     /// This function is randomized. It internally samples a scalar element using `OsRng`.
-    #[cfg(not(target_arch = "bpf"))]
+    #[cfg(not(target_os = "solana"))]
     fn encrypt<T: Into<Scalar>>(public: &ElGamalPubkey, amount: T) -> ElGamalCiphertext {
         let (commitment, opening) = Pedersen::new(amount);
         let handle = public.decrypt_handle(&opening);
@@ -93,6 +94,7 @@ impl ElGamal {
 
     /// On input a public key, message, and Pedersen opening, the function
     /// returns the corresponding ElGamal ciphertext.
+    #[cfg(not(target_os = "solana"))]
     fn encrypt_with<T: Into<Scalar>>(
         amount: T,
         public: &ElGamalPubkey,
@@ -104,40 +106,42 @@ impl ElGamal {
         ElGamalCiphertext { commitment, handle }
     }
 
+    /// On input a message, the function returns a twisted ElGamal ciphertext where the associated
+    /// Pedersen opening is always zero. Since the opening is zero, any twisted ElGamal ciphertext
+    /// of this form is a valid ciphertext under any ElGamal public key.
+    #[cfg(not(target_os = "solana"))]
+    pub fn encode<T: Into<Scalar>>(amount: T) -> ElGamalCiphertext {
+        let commitment = Pedersen::encode(amount);
+        let handle = DecryptHandle(RistrettoPoint::identity());
+
+        ElGamalCiphertext { commitment, handle }
+    }
+
     /// On input a secret key and a ciphertext, the function returns the decrypted message.
     ///
     /// The output of this function is of type `DiscreteLog`. To recover, the originally encrypted
     /// message, use `DiscreteLog::decode`.
+    #[cfg(not(target_os = "solana"))]
     fn decrypt(secret: &ElGamalSecretKey, ciphertext: &ElGamalCiphertext) -> DiscreteLog {
-        DiscreteLog {
-            generator: *G,
-            target: &ciphertext.commitment.0 - &(&secret.0 * &ciphertext.handle.0),
-        }
+        DiscreteLog::new(
+            *G,
+            &ciphertext.commitment.0 - &(&secret.0 * &ciphertext.handle.0),
+        )
     }
 
     /// On input a secret key and a ciphertext, the function returns the decrypted message
     /// interpretted as type `u32`.
-    fn decrypt_u32(secret: &ElGamalSecretKey, ciphertext: &ElGamalCiphertext) -> Option<u32> {
+    #[cfg(not(target_os = "solana"))]
+    fn decrypt_u32(secret: &ElGamalSecretKey, ciphertext: &ElGamalCiphertext) -> Option<u64> {
         let discrete_log_instance = Self::decrypt(secret, ciphertext);
         discrete_log_instance.decode_u32()
-    }
-
-    /// On input a secret key, a ciphertext, and a pre-computed hashmap, the function returns the
-    /// decrypted message interpretted as type `u32`.
-    fn decrypt_u32_online(
-        secret: &ElGamalSecretKey,
-        ciphertext: &ElGamalCiphertext,
-        hashmap: &DecodeU32Precomputation,
-    ) -> Option<u32> {
-        let discrete_log_instance = Self::decrypt(secret, ciphertext);
-        discrete_log_instance.decode_u32_online(hashmap)
     }
 }
 
 /// A (twisted) ElGamal encryption keypair.
 ///
 /// The instances of the secret key are zeroized on drop.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Zeroize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, Zeroize)]
 pub struct ElGamalKeypair {
     /// The public half of this keypair.
     pub public: ElGamalPubkey,
@@ -147,7 +151,7 @@ pub struct ElGamalKeypair {
 
 impl ElGamalKeypair {
     /// Deterministically derives an ElGamal keypair from an Ed25519 signing key and a Solana address.
-    #[cfg(not(target_arch = "bpf"))]
+    #[cfg(not(target_os = "solana"))]
     #[allow(non_snake_case)]
     pub fn new(signer: &dyn Signer, address: &Pubkey) -> Result<Self, SignerError> {
         let message = Message::new(
@@ -177,7 +181,7 @@ impl ElGamalKeypair {
     /// Generates the public and secret keys for ElGamal encryption.
     ///
     /// This function is randomized. It internally samples a scalar element using `OsRng`.
-    #[cfg(not(target_arch = "bpf"))]
+    #[cfg(not(target_os = "solana"))]
     #[allow(clippy::new_ret_no_self)]
     pub fn new_rand() -> Self {
         ElGamal::keygen()
@@ -281,7 +285,7 @@ impl ElGamalPubkey {
     /// Encrypts an amount under the public key.
     ///
     /// This function is randomized. It internally samples a scalar element using `OsRng`.
-    #[cfg(not(target_arch = "bpf"))]
+    #[cfg(not(target_os = "solana"))]
     pub fn encrypt<T: Into<Scalar>>(&self, amount: T) -> ElGamalCiphertext {
         ElGamal::encrypt(self, amount)
     }
@@ -359,18 +363,8 @@ impl ElGamalSecretKey {
     }
 
     /// Decrypts a ciphertext using the ElGamal secret key interpretting the message as type `u32`.
-    pub fn decrypt_u32(&self, ciphertext: &ElGamalCiphertext) -> Option<u32> {
+    pub fn decrypt_u32(&self, ciphertext: &ElGamalCiphertext) -> Option<u64> {
         ElGamal::decrypt_u32(self, ciphertext)
-    }
-
-    /// Decrypts a ciphertext using the ElGamal secret key and a pre-computed hashmap. It
-    /// interprets the decrypted message as type `u32`.
-    pub fn decrypt_u32_online(
-        &self,
-        ciphertext: &ElGamalCiphertext,
-        hashmap: &DecodeU32Precomputation,
-    ) -> Option<u32> {
-        ElGamal::decrypt_u32_online(self, ciphertext, hashmap)
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -458,28 +452,24 @@ impl ElGamalCiphertext {
     }
 
     /// Decrypts the ciphertext using an ElGamal secret key interpretting the message as type `u32`.
-    pub fn decrypt_u32(&self, secret: &ElGamalSecretKey) -> Option<u32> {
+    pub fn decrypt_u32(&self, secret: &ElGamalSecretKey) -> Option<u64> {
         ElGamal::decrypt_u32(secret, self)
     }
+}
 
-    /// Decrypts the ciphertext using an ElGamal secret key and a pre-computed hashmap. It
-    /// interprets the decrypted message as type `u32`.
-    pub fn decrypt_u32_online(
-        &self,
-        secret: &ElGamalSecretKey,
-        hashmap: &DecodeU32Precomputation,
-    ) -> Option<u32> {
-        ElGamal::decrypt_u32_online(secret, self, hashmap)
+impl fmt::Display for ElGamalCiphertext {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", base64::encode(self.to_bytes()))
     }
 }
 
 impl<'a, 'b> Add<&'b ElGamalCiphertext> for &'a ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
-    fn add(self, other: &'b ElGamalCiphertext) -> ElGamalCiphertext {
+    fn add(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
         ElGamalCiphertext {
-            commitment: &self.commitment + &other.commitment,
-            handle: &self.handle + &other.handle,
+            commitment: &self.commitment + &ciphertext.commitment,
+            handle: &self.handle + &ciphertext.handle,
         }
     }
 }
@@ -493,10 +483,10 @@ define_add_variants!(
 impl<'a, 'b> Sub<&'b ElGamalCiphertext> for &'a ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
-    fn sub(self, other: &'b ElGamalCiphertext) -> ElGamalCiphertext {
+    fn sub(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
         ElGamalCiphertext {
-            commitment: &self.commitment - &other.commitment,
-            handle: &self.handle - &other.handle,
+            commitment: &self.commitment - &ciphertext.commitment,
+            handle: &self.handle - &ciphertext.handle,
         }
     }
 }
@@ -510,10 +500,10 @@ define_sub_variants!(
 impl<'a, 'b> Mul<&'b Scalar> for &'a ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
-    fn mul(self, other: &'b Scalar) -> ElGamalCiphertext {
+    fn mul(self, scalar: &'b Scalar) -> ElGamalCiphertext {
         ElGamalCiphertext {
-            commitment: &self.commitment * other,
-            handle: &self.handle * other,
+            commitment: &self.commitment * scalar,
+            handle: &self.handle * scalar,
         }
     }
 }
@@ -521,6 +511,23 @@ impl<'a, 'b> Mul<&'b Scalar> for &'a ElGamalCiphertext {
 define_mul_variants!(
     LHS = ElGamalCiphertext,
     RHS = Scalar,
+    Output = ElGamalCiphertext
+);
+
+impl<'a, 'b> Mul<&'b ElGamalCiphertext> for &'a Scalar {
+    type Output = ElGamalCiphertext;
+
+    fn mul(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
+        ElGamalCiphertext {
+            commitment: self * &ciphertext.commitment,
+            handle: self * &ciphertext.handle,
+        }
+    }
+}
+
+define_mul_variants!(
+    LHS = Scalar,
+    RHS = ElGamalCiphertext,
     Output = ElGamalCiphertext
 );
 
@@ -551,8 +558,8 @@ impl DecryptHandle {
 impl<'a, 'b> Add<&'b DecryptHandle> for &'a DecryptHandle {
     type Output = DecryptHandle;
 
-    fn add(self, other: &'b DecryptHandle) -> DecryptHandle {
-        DecryptHandle(&self.0 + &other.0)
+    fn add(self, handle: &'b DecryptHandle) -> DecryptHandle {
+        DecryptHandle(&self.0 + &handle.0)
     }
 }
 
@@ -565,8 +572,8 @@ define_add_variants!(
 impl<'a, 'b> Sub<&'b DecryptHandle> for &'a DecryptHandle {
     type Output = DecryptHandle;
 
-    fn sub(self, other: &'b DecryptHandle) -> DecryptHandle {
-        DecryptHandle(&self.0 - &other.0)
+    fn sub(self, handle: &'b DecryptHandle) -> DecryptHandle {
+        DecryptHandle(&self.0 - &handle.0)
     }
 }
 
@@ -579,18 +586,28 @@ define_sub_variants!(
 impl<'a, 'b> Mul<&'b Scalar> for &'a DecryptHandle {
     type Output = DecryptHandle;
 
-    fn mul(self, other: &'b Scalar) -> DecryptHandle {
-        DecryptHandle(&self.0 * other)
+    fn mul(self, scalar: &'b Scalar) -> DecryptHandle {
+        DecryptHandle(&self.0 * scalar)
     }
 }
 
 define_mul_variants!(LHS = DecryptHandle, RHS = Scalar, Output = DecryptHandle);
 
+impl<'a, 'b> Mul<&'b DecryptHandle> for &'a Scalar {
+    type Output = DecryptHandle;
+
+    fn mul(self, handle: &'b DecryptHandle) -> DecryptHandle {
+        DecryptHandle(self * &handle.0)
+    }
+}
+
+define_mul_variants!(LHS = Scalar, RHS = DecryptHandle, Output = DecryptHandle);
+
 #[cfg(test)]
 mod tests {
     use {
         super::*,
-        crate::encryption::{discrete_log::DECODE_U32_PRECOMPUTATION_FOR_G, pedersen::Pedersen},
+        crate::encryption::pedersen::Pedersen,
         solana_sdk::{signature::Keypair, signer::null_signer::NullSigner},
     };
 
@@ -600,18 +617,21 @@ mod tests {
         let amount: u32 = 57;
         let ciphertext = ElGamal::encrypt(&public, amount);
 
-        let expected_instance = DiscreteLog {
-            generator: *G,
-            target: Scalar::from(amount) * &(*G),
-        };
+        let expected_instance = DiscreteLog::new(*G, Scalar::from(amount) * &(*G));
 
         assert_eq!(expected_instance, ElGamal::decrypt(&secret, &ciphertext));
-        assert_eq!(
-            57_u32,
-            secret
-                .decrypt_u32_online(&ciphertext, &(*DECODE_U32_PRECOMPUTATION_FOR_G))
-                .unwrap()
-        );
+        assert_eq!(57_u64, secret.decrypt_u32(&ciphertext).unwrap());
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_correctness_multithreaded() {
+        let ElGamalKeypair { public, secret } = ElGamalKeypair::new_rand();
+        let amount: u32 = 57;
+        let ciphertext = ElGamal::encrypt(&public, amount);
+
+        let mut instance = ElGamal::decrypt(&secret, &ciphertext);
+        instance.num_threads(4).unwrap();
+        assert_eq!(57_u64, instance.decode_u32().unwrap());
     }
 
     #[test]
@@ -640,10 +660,7 @@ mod tests {
             handle: handle_1,
         };
 
-        let expected_instance = DiscreteLog {
-            generator: *G,
-            target: Scalar::from(amount) * (*G),
-        };
+        let expected_instance = DiscreteLog::new(*G, Scalar::from(amount) * &(*G));
 
         assert_eq!(expected_instance, secret_0.decrypt(&ciphertext_0));
         assert_eq!(expected_instance, secret_1.decrypt(&ciphertext_1));
@@ -716,6 +733,7 @@ mod tests {
             ElGamal::encrypt_with(amount_0 * amount_1, &public, &(&opening * scalar));
 
         assert_eq!(ciphertext_prod, ciphertext * scalar);
+        assert_eq!(ciphertext_prod, scalar * ciphertext);
     }
 
     #[test]

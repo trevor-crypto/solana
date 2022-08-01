@@ -21,15 +21,21 @@ export RUST_BACKTRACE=1
 export RUSTFLAGS="-D warnings"
 source scripts/ulimit-n.sh
 
-# Limit compiler jobs to reduce memory usage
-# on machines with 2gb/thread of memory
+# limit jobs to 4gb/thread
+if [[ -f "/proc/meminfo" ]]; then
+  JOBS=$(grep MemTotal /proc/meminfo | awk '{printf "%.0f", ($2 / (4 * 1024 * 1024))}')
+else
+  JOBS=$(sysctl hw.memsize | awk '{printf "%.0f", ($2 / (4 * 1024**3))}')
+fi
+
 NPROC=$(nproc)
-NPROC=$((NPROC>14 ? 14 : NPROC))
+JOBS=$((JOBS>NPROC ? NPROC : JOBS))
+
 
 echo "Executing $testName"
 case $testName in
 test-stable)
-  _ "$cargo" stable test --jobs "$NPROC" --all --exclude solana-local-cluster ${V:+--verbose} -- --nocapture
+  _ "$cargo" stable test --jobs "$JOBS" --all --tests --exclude solana-local-cluster ${V:+--verbose} -- --nocapture
   ;;
 test-stable-bpf)
   # Clear the C dependency files, if dependency moves these files are not regenerated
@@ -63,7 +69,23 @@ test-stable-bpf)
       "$cargo_test_bpf" --bpf-sdk ../../../../sdk/bpf
       popd
     fi
-  done
+  done |& tee cargo.log
+  # Save the output of cargo building the bpf tests so we can analyze
+  # the number of redundant rebuilds of dependency crates. The
+  # expected number of solana-program crate compilations is 4. There
+  # should be 3 builds of solana-program while 128bit crate is
+  # built. These compilations are not redundant because the crate is
+  # built for different target each time. An additional compilation of
+  # solana-program is performed when simulation crate is built. This
+  # last compiled solana-program is of different version, normally the
+  # latest mainbeta release version.
+  solana_program_count=$(grep -c 'solana-program v' cargo.log)
+  rm -f cargo.log
+  if ((solana_program_count > 10)); then
+      echo "Regression of build redundancy ${solana_program_count}."
+      echo "Review dependency features that trigger redundant rebuilds of solana-program."
+      exit 1
+  fi
 
   # bpf-tools version
   "$cargo_build_bpf" -V
@@ -111,9 +133,14 @@ test-local-cluster-flakey)
   _ "$cargo" stable test --release --package solana-local-cluster --test local_cluster_flakey ${V:+--verbose} -- --nocapture --test-threads=1
   exit 0
   ;;
-test-local-cluster-slow)
+test-local-cluster-slow-1)
   _ "$cargo" stable build --release --bins ${V:+--verbose}
-  _ "$cargo" stable test --release --package solana-local-cluster --test local_cluster_slow ${V:+--verbose} -- --nocapture --test-threads=1
+  _ "$cargo" stable test --release --package solana-local-cluster --test local_cluster_slow_1 ${V:+--verbose} -- --nocapture --test-threads=1
+  exit 0
+  ;;
+test-local-cluster-slow-2)
+  _ "$cargo" stable build --release --bins ${V:+--verbose}
+  _ "$cargo" stable test --release --package solana-local-cluster --test local_cluster_slow_2 ${V:+--verbose} -- --nocapture --test-threads=1
   exit 0
   ;;
 test-wasm)
@@ -127,6 +154,10 @@ test-wasm)
       popd
     fi
   done
+  exit 0
+  ;;
+test-docs)
+  _ "$cargo" stable test --jobs "$JOBS" --all --doc --exclude solana-local-cluster ${V:+--verbose} -- --nocapture
   exit 0
   ;;
 *)

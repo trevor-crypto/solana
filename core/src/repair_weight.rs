@@ -310,8 +310,7 @@ impl RepairWeight {
         // Purge `self.unrooted_slots` of slots less than `new_root` as we know any
         // unrooted votes for slots < `new_root` will now be rejected, so we won't
         // need to check `self.unrooted_slots` to see if those slots are unrooted.
-        let mut new_unrooted_slots = self.unrooted_slots.split_off(&new_root);
-        std::mem::swap(&mut self.unrooted_slots, &mut new_unrooted_slots);
+        self.unrooted_slots = self.unrooted_slots.split_off(&new_root);
         self.root = new_root;
     }
 
@@ -642,7 +641,7 @@ impl RepairWeight {
     }
 
     // Heavier, smaller slots come first
-    fn sort_by_stake_weight_slot(slot_stake_voted: &mut Vec<(Slot, u64)>) {
+    fn sort_by_stake_weight_slot(slot_stake_voted: &mut [(Slot, u64)]) {
         slot_stake_voted.sort_by(|(slot, stake_voted), (slot_, stake_voted_)| {
             if stake_voted == stake_voted_ {
                 slot.cmp(slot_)

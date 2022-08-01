@@ -11,6 +11,7 @@ pub mod parse_nonce;
 pub mod parse_stake;
 pub mod parse_sysvar;
 pub mod parse_token;
+pub mod parse_token_extension;
 pub mod parse_vote;
 pub mod validator_info;
 
@@ -33,7 +34,7 @@ pub type StringDecimals = String;
 pub const MAX_BASE58_BYTES: usize = 128;
 
 /// A duplicate representation of an Account for pretty JSON serialization
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiAccount {
     pub lamports: u64,
@@ -43,7 +44,7 @@ pub struct UiAccount {
     pub rent_epoch: Epoch,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", untagged)]
 pub enum UiAccountData {
     LegacyBinary(String), // Legacy. Retained for RPC backwards compatibility
@@ -156,7 +157,7 @@ impl UiAccount {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiFeeCalculator {
     pub lamports_per_signature: StringAmount,
